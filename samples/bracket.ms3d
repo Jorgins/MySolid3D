@@ -1,0 +1,21 @@
+{
+  "features": [
+    { "id": 1, "name": "Эскиз1", "kind": { "Sketch": {
+        "plane": { "origin": [0, 0, 0], "x": [1, 0, 0], "y": [0, 1, 0] },
+        "shapes": [ { "Rect": { "x": 0, "y": 0, "w": 60, "h": 40 } } ] } } },
+    { "id": 2, "name": "Бобышка-Вытянуть1", "kind": { "Boss": { "sketch": 1, "depth": 12, "flip": false } } },
+    { "id": 3, "name": "Эскиз2", "kind": { "Sketch": {
+        "plane": { "origin": [0, 0, 12], "x": [1, 0, 0], "y": [0, 1, 0] },
+        "shapes": [ { "Circle": { "cx": 42, "cy": 20, "r": 13 } } ] } } },
+    { "id": 4, "name": "Бобышка-Вытянуть2", "kind": { "Boss": { "sketch": 3, "depth": 18, "flip": false } } },
+    { "id": 5, "name": "Эскиз3", "kind": { "Sketch": {
+        "plane": { "origin": [0, 0, 30], "x": [1, 0, 0], "y": [0, 1, 0] },
+        "shapes": [ { "Circle": { "cx": 42, "cy": 20, "r": 7 } } ] } } },
+    { "id": 6, "name": "Вырез-Вытянуть1", "kind": { "Cut": { "sketch": 5, "depth": 10, "through_all": true, "flip": false } } },
+    { "id": 7, "name": "Эскиз4", "kind": { "Sketch": {
+        "plane": { "origin": [0, 0, 12], "x": [1, 0, 0], "y": [0, 1, 0] },
+        "shapes": [ { "Rect": { "x": 6, "y": 8, "w": 14, "h": 24 } } ] } } },
+    { "id": 8, "name": "Вырез-Вытянуть2", "kind": { "Cut": { "sketch": 7, "depth": 6, "through_all": false, "flip": false } } }
+  ],
+  "next_id": 8
+}

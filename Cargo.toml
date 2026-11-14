@@ -1,0 +1,37 @@
+[package]
+name = "mysolid3d"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CAD-ядро (B-rep, булевы операции, STL/STEP)
+opencascade = "0.3"
+glam = { version = "0.24", features = ["serde"] }
+# Интерфейс: egui поверх OpenGL (лёгкий, работает на старых видеокартах)
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+
+# Интерфейсные библиотеки оптимизируем и в отладочной сборке — иначе egui заметно медленнее.
+# (Точечно, а не "*": смена профиля у occt-sys запускает полную пересборку OpenCascade.)
+[profile.dev.package.egui]
+opt-level = 2
+[profile.dev.package.epaint]
+opt-level = 2
+[profile.dev.package.emath]
+opt-level = 2
+[profile.dev.package.ecolor]
+opt-level = 2
+[profile.dev.package.egui_glow]
+opt-level = 2
+[profile.dev.package.glam]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Локальная копия с исправлением сборки под MSVC (конструирование Handle_* в C++-привязках).
+[patch.crates-io]
+opencascade-sys = { path = "vendor/opencascade-sys" }

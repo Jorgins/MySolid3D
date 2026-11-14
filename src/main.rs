@@ -1,0 +1,23 @@
+// В релизной сборке не открываем консольное окно.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod app;
+mod camera;
+mod model;
+mod render;
+
+use eframe::egui;
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("MySolid3D")
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([800.0, 500.0]),
+        renderer: eframe::Renderer::Glow,
+        multisampling: 4,
+        depth_buffer: 24,
+        ..Default::default()
+    };
+    eframe::run_native("MySolid3D", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)?))))
+}

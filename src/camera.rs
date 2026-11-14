@@ -1,0 +1,132 @@
+//! Орбитальная камера с ортографической проекцией (ось Z — вверх).
+
+use crate::model::Plane;
+use eframe::egui::{Pos2, Rect, Vec2};
+use glam::DVec3;
+
+#[derive(Clone)]
+pub struct Camera {
+    pub yaw: f64,
+    pub pitch: f64,
+    pub target: DVec3,
+    /// Пикселей на миллиметр.
+    pub scale: f64,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        let mut c = Camera { yaw: 0.0, pitch: 0.0, target: DVec3::ZERO, scale: 4.0 };
+        c.set_iso();
+        c
+    }
+}
+
+impl Camera {
+    /// Направление от цели к наблюдателю.
+    fn eye_dir(&self) -> DVec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        DVec3::new(cp * cy, cp * sy, sp)
+    }
+
+    pub fn forward(&self) -> DVec3 {
+        -self.eye_dir()
+    }
+
+    pub fn right(&self) -> DVec3 {
+        DVec3::new(-self.yaw.sin(), self.yaw.cos(), 0.0)
+    }
+
+    pub fn up(&self) -> DVec3 {
+        self.eye_dir().cross(self.right())
+    }
+
+    pub fn set_iso(&mut self) {
+        self.yaw = (-45.0f64).to_radians();
+        self.pitch = (35.264f64).to_radians();
+    }
+
+    /// Смотреть перпендикулярно плоскости, ось X плоскости — вправо.
+    pub fn look_at_plane(&mut self, plane: &Plane) {
+        let n = plane.normal();
+        self.pitch = n.z.clamp(-1.0, 1.0).asin();
+        self.yaw = if n.z.abs() > 0.999 { (-plane.x.x).atan2(plane.x.y) } else { n.y.atan2(n.x) };
+    }
+
+    pub fn project(&self, rect: Rect, p: DVec3) -> Pos2 {
+        let d = p - self.target;
+        let c = rect.center();
+        Pos2::new(
+            c.x + (d.dot(self.right()) * self.scale) as f32,
+            c.y - (d.dot(self.up()) * self.scale) as f32,
+        )
+    }
+
+    /// Луч из точки экрана: (начало далеко перед сценой, направление взгляда).
+    pub fn ray(&self, rect: Rect, pos: Pos2) -> (DVec3, DVec3) {
+        let o = pos - rect.center();
+        let f = self.forward();
+        let on_plane = self.target + self.right() * (o.x as f64 / self.scale)
+            - self.up() * (o.y as f64 / self.scale);
+        (on_plane - f * 1.0e5, f)
+    }
+
+    /// Точка экрана в координатах плоскости эскиза.
+    pub fn screen_to_plane(&self, rect: Rect, pos: Pos2, plane: &Plane) -> Option<glam::DVec2> {
+        let (o, d) = self.ray(rect, pos);
+        let n = plane.normal();
+        let denom = d.dot(n);
+        if denom.abs() < 1e-6 {
+            return None;
+        }
+        let t = (plane.origin - o).dot(n) / denom;
+        Some(plane.to_local(o + d * t))
+    }
+
+    pub fn orbit(&mut self, delta: Vec2) {
+        self.yaw -= delta.x as f64 * 0.008;
+        let limit = std::f64::consts::FRAC_PI_2;
+        self.pitch = (self.pitch + delta.y as f64 * 0.008).clamp(-limit, limit);
+    }
+
+    pub fn pan(&mut self, delta: Vec2) {
+        self.target += (self.up() * delta.y as f64 - self.right() * delta.x as f64) / self.scale;
+    }
+
+    /// Масштабирование с сохранением точки под курсором.
+    pub fn zoom(&mut self, rect: Rect, pos: Pos2, factor: f64) {
+        let new_scale = (self.scale * factor).clamp(0.01, 5000.0);
+        let o = pos - rect.center();
+        let k = 1.0 / self.scale - 1.0 / new_scale;
+        self.target += (self.right() * o.x as f64 - self.up() * o.y as f64) * k;
+        self.scale = new_scale;
+    }
+
+    pub fn fit(&mut self, rect: Rect, bounds: Option<(DVec3, DVec3)>) {
+        let (min, max) = bounds.unwrap_or((DVec3::splat(-30.0), DVec3::splat(30.0)));
+        self.target = (min + max) * 0.5;
+        let diag = (max - min).length().max(1.0);
+        self.scale = rect.width().min(rect.height()).max(50.0) as f64 / (diag * 1.25);
+    }
+
+    /// Матрица мир → clip-пространство OpenGL (по столбцам).
+    pub fn view_proj(&self, rect: Rect, depth_range: f64) -> [f32; 16] {
+        let (r, u, f, t) = (self.right(), self.up(), self.forward(), self.target);
+        let sx = self.scale / (rect.width() as f64 * 0.5);
+        let sy = self.scale / (rect.height() as f64 * 0.5);
+        let sz = 1.0 / depth_range;
+        [
+            r.x * sx, u.x * sy, f.x * sz, 0.0,
+            r.y * sx, u.y * sy, f.y * sz, 0.0,
+            r.z * sx, u.z * sy, f.z * sz, 0.0,
+            -r.dot(t) * sx, -u.dot(t) * sy, -f.dot(t) * sz, 1.0,
+        ]
+        .map(|v| v as f32)
+    }
+
+    /// Поворот нормалей в пространство вида (по столбцам): x — вправо, y — вверх, z — к зрителю.
+    pub fn normal_matrix(&self) -> [f32; 9] {
+        let (r, u, e) = (self.right(), self.up(), self.eye_dir());
+        [r.x, u.x, e.x, r.y, u.y, e.y, r.z, u.z, e.z].map(|v| v as f32)
+    }
+}
