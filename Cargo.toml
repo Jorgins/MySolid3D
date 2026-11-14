@@ -35,3 +35,5 @@ lto = "thin"
 # Локальная копия с исправлением сборки под MSVC (конструирование Handle_* в C++-привязках).
 [patch.crates-io]
 opencascade-sys = { path = "vendor/opencascade-sys" }
+# Локальная копия с безопасными скруглением и фаской (try_fillet_edges / try_chamfer_edges).
+opencascade = { path = "vendor/opencascade" }

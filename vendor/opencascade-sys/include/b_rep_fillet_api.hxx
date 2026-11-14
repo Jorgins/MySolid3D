@@ -22,3 +22,25 @@ BRepFilletAPI_MakeFillet2d_add_chamfer_angle(BRepFilletAPI_MakeFillet2d &make_fi
                                              const Standard_Real angle) {
   return std::unique_ptr<TopoDS_Edge>(new TopoDS_Edge(make_fillet.AddChamfer(edge, vertex, dist, angle)));
 }
+
+// Построение с проверкой: при ошибке OCCT бросает Standard_Failure (не std::exception),
+// что через границу FFI завершило бы процесс. Возвращаем nullptr вместо исключения.
+template <typename Maker> inline std::unique_ptr<TopoDS_Shape> build_shape_checked(Maker &maker) {
+  try {
+    maker.Build(Message_ProgressRange());
+    if (!maker.IsDone()) {
+      return nullptr;
+    }
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(maker.Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+inline std::unique_ptr<TopoDS_Shape> BRepFilletAPI_MakeFillet_build_checked(BRepFilletAPI_MakeFillet &maker) {
+  return build_shape_checked(maker);
+}
+
+inline std::unique_ptr<TopoDS_Shape> BRepFilletAPI_MakeChamfer_build_checked(BRepFilletAPI_MakeChamfer &maker) {
+  return build_shape_checked(maker);
+}

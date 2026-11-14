@@ -1898,8 +1898,6 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "opencascade"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e9b350ed6cc9b368519c3a745ef6e834cf2fd1c84c863fd483e59b1d87cbdc"
 dependencies = [
  "cxx",
  "glam",

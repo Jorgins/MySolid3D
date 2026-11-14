@@ -1,7 +1,10 @@
 //! Интерфейс: панель инструментов, дерево построения, свойства и 3D-вид.
 
 use crate::camera::Camera;
-use crate::model::{FeatureKind, Part, Plane, RenderMesh, Sketch, SketchShape, MIN_SIZE};
+use crate::model::{
+    arc_radius, bulge_through, segment_points, FeatureKind, Part, PathPoint, Plane, RenderMesh, Sketch,
+    SketchShape, MIN_SIZE,
+};
 use crate::render::{DrawParams, Renderer};
 use eframe::egui::{
     self, Align2, Color32, FontId, Painter, PointerButton, Pos2, Rect, Response, Stroke, Vec2,
@@ -17,17 +20,21 @@ const ERROR_COLOR: Color32 = Color32::from_rgb(240, 100, 90);
 const SKETCH_COLOR: Color32 = Color32::from_rgb(120, 190, 255);
 const SELECT_COLOR: Color32 = Color32::from_rgb(255, 185, 70);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Selection {
     None,
     Plane(usize),
     Face(usize),
+    /// Рёбра тела (индексы в `RenderMesh::edges`).
+    Edges(Vec<usize>),
     Feature(u64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Select,
+    Line,
+    Arc,
     Rect,
     Circle,
 }
@@ -46,6 +53,32 @@ struct SketchEdit {
     drag_start: Option<DVec2>,
     move_last: Option<DVec2>,
     selected: Option<usize>,
+    /// Контур, который сейчас рисуется инструментами «Линия» / «Дуга».
+    chain: Option<usize>,
+    /// Конечная точка дуги, для которой ещё не указана точка на дуге.
+    arc_end: Option<DVec2>,
+    /// Перетаскиваемая точка контура: (фигура, точка).
+    drag_vertex: Option<(usize, usize)>,
+}
+
+impl SketchEdit {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            tool: Tool::Line,
+            drag_start: None,
+            move_last: None,
+            selected: None,
+            chain: None,
+            arc_end: None,
+            drag_vertex: None,
+        }
+    }
+
+    fn stop_chain(&mut self) {
+        self.chain = None;
+        self.arc_end = None;
+    }
 }
 
 struct DimLabel {
@@ -73,6 +106,7 @@ pub struct App {
     renderer: Arc<Mutex<Renderer>>,
     selection: Selection,
     hover_face: Option<usize>,
+    hover_edge: Option<usize>,
     sketch: Option<SketchEdit>,
     dim_edit: Option<DimEdit>,
     snap: bool,
@@ -86,26 +120,17 @@ fn fmt_mm(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn shape_outline(plane: &Plane, shape: &SketchShape) -> Vec<DVec3> {
-    match *shape {
-        SketchShape::Rect { x, y, w, h } => {
-            [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
-                .iter()
-                .map(|&(px, py)| plane.to_world(DVec2::new(px, py)))
-                .collect()
-        }
-        SketchShape::Circle { cx, cy, r } => (0..=72)
-            .map(|i| {
-                let a = i as f64 / 72.0 * std::f64::consts::TAU;
-                plane.to_world(DVec2::new(cx + r * a.cos(), cy + r * a.sin()))
-            })
-            .collect(),
-    }
+fn draw_shape(painter: &Painter, cam: &Camera, rect: Rect, plane: &Plane, s: &SketchShape, stroke: Stroke) {
+    let pts: Vec<Pos2> = s.outline().iter().map(|p| cam.project(rect, plane.to_world(*p))).collect();
+    painter.line(pts, stroke);
 }
 
-fn draw_shape(painter: &Painter, cam: &Camera, rect: Rect, plane: &Plane, s: &SketchShape, stroke: Stroke) {
-    let pts: Vec<Pos2> = shape_outline(plane, s).iter().map(|p| cam.project(rect, *p)).collect();
-    painter.line(pts, stroke);
+/// Расстояние в пикселях от точки до отрезка на экране.
+fn screen_segment_distance(a: Pos2, b: Pos2, p: Pos2) -> f32 {
+    let d = b - a;
+    let len2 = d.length_sq();
+    let t = if len2 < 1e-6 { 0.0 } else { ((p - a).dot(d) / len2).clamp(0.0, 1.0) };
+    (a + d * t - p).length()
 }
 
 fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
@@ -138,6 +163,7 @@ impl App {
             renderer: Arc::new(Mutex::new(renderer)),
             selection: Selection::None,
             hover_face: None,
+            hover_edge: None,
             sketch: None,
             dim_edit: None,
             snap: true,
@@ -160,7 +186,9 @@ impl App {
             self.renderer.lock().unwrap().upload(gl, &self.mesh);
         }
         self.hover_face = None;
-        if let Selection::Face(_) = self.selection {
+        self.hover_edge = None;
+        // Номера граней и рёбер после пересчёта другие.
+        if matches!(self.selection, Selection::Face(_) | Selection::Edges(_)) {
             self.selection = Selection::None;
         }
         self.dirty = false;
@@ -190,14 +218,20 @@ impl App {
     fn enter_sketch(&mut self, id: u64) {
         let Some(plane) = self.part.sketch(id).map(|s| s.plane) else { return };
         self.cam.look_at_plane(&plane);
-        self.sketch =
-            Some(SketchEdit { id, tool: Tool::Rect, drag_start: None, move_last: None, selected: None });
+        self.sketch = Some(SketchEdit::new(id));
         self.selection = Selection::Feature(id);
         self.status.clear();
         self.dirty = true;
     }
 
     fn exit_sketch(&mut self) {
+        // Контуры из одной точки (начали и бросили) не сохраняем.
+        if let Some(sketch) = self.sketch.as_ref().and_then(|e| self.part.sketch_mut(e.id)) {
+            sketch.shapes.retain(|s| !matches!(s, SketchShape::Path { points, .. } if points.len() < 2));
+            if sketch.shapes.iter().any(|s| !s.is_closed()) {
+                self.status = "В эскизе остался незамкнутый контур — вытянуть его не получится".into();
+            }
+        }
         self.sketch = None;
         self.dim_edit = None;
         self.cam.set_iso();
@@ -225,6 +259,26 @@ impl App {
             )
         } else {
             self.part.add("Бобышка-Вытянуть", FeatureKind::Boss { sketch, depth: 10.0, flip: false })
+        };
+        self.selection = Selection::Feature(id);
+        self.status.clear();
+        self.dirty = true;
+    }
+
+    /// Скругление или фаска на выбранных рёбрах.
+    fn add_edge_feature(&mut self, chamfer: bool) {
+        let edges: Vec<DVec3> = match &self.selection {
+            Selection::Edges(list) => list.iter().filter_map(|&i| self.mesh.edges.get(i)).map(|e| e.mid).collect(),
+            _ => vec![],
+        };
+        if edges.is_empty() {
+            self.status = "Сначала выберите рёбра детали (Ctrl+щелчок — добавить ребро к выбранным)".into();
+            return;
+        }
+        let id = if chamfer {
+            self.part.add("Фаска", FeatureKind::Chamfer { edges, distance: 1.0 })
+        } else {
+            self.part.add("Скругление", FeatureKind::Fillet { edges, radius: 2.0 })
         };
         self.selection = Selection::Feature(id);
         self.status.clear();
@@ -305,6 +359,10 @@ impl App {
                 if let Some(edit) = &mut self.sketch {
                     ui.strong("Эскиз:");
                     ui.selectable_value(&mut edit.tool, Tool::Select, "Выбор / перенос");
+                    ui.selectable_value(&mut edit.tool, Tool::Line, "Линия")
+                        .on_hover_text("Щелчками задавайте точки контура; щелчок по первой точке замыкает его");
+                    ui.selectable_value(&mut edit.tool, Tool::Arc, "Дуга")
+                        .on_hover_text("Щелчок — конец дуги, второй щелчок — точка, через которую она проходит");
                     ui.selectable_value(&mut edit.tool, Tool::Rect, "Прямоугольник");
                     ui.selectable_value(&mut edit.tool, Tool::Circle, "Окружность");
                     ui.separator();
@@ -351,6 +409,12 @@ impl App {
                 }
                 if ui.button("Вырез-вытянуть").on_hover_text("Вырезать эскизом из тела").clicked() {
                     self.add_extrude(true);
+                }
+                if ui.button("Скругление").on_hover_text("Скруглить выбранные рёбра").clicked() {
+                    self.add_edge_feature(false);
+                }
+                if ui.button("Фаска").on_hover_text("Снять фаску с выбранных рёбер").clicked() {
+                    self.add_edge_feature(true);
                 }
             }
             ui.separator();
@@ -444,6 +508,16 @@ impl App {
                     ui.weak("Эскиз можно создать только на плоской грани.");
                 }
             }
+            Selection::Edges(ref list) => {
+                ui.label(format!("Выбрано рёбер: {}", list.len()));
+                ui.weak("Ctrl+щелчок — добавить или убрать ребро.");
+                ui.add_space(4.0);
+                let fillet = ui.button("Скругление").clicked();
+                let chamfer = ui.button("Фаска").clicked();
+                if fillet || chamfer {
+                    self.add_edge_feature(chamfer);
+                }
+            }
             Selection::Feature(id) => self.feature_properties(ui, id),
         }
     }
@@ -495,6 +569,15 @@ impl App {
                 changed |= ui.checkbox(through_all, "Насквозь").changed();
                 changed |= depth_row(ui, depth, !*through_all);
                 changed |= ui.checkbox(flip, "Обратное направление").changed();
+            }
+            FeatureKind::Fillet { edges, radius: size } | FeatureKind::Chamfer { edges, distance: size } => {
+                ui.horizontal(|ui| {
+                    ui.label("Размер");
+                    let drag =
+                        egui::DragValue::new(size).speed(0.1).range(MIN_SIZE..=1.0e3).max_decimals(2).suffix(" мм");
+                    changed |= ui.add(drag).changed();
+                });
+                ui.weak(format!("Рёбер: {}", edges.len()));
             }
         }
         if editing.is_none() {
@@ -558,22 +641,36 @@ impl App {
 
         // Выбор граней (только вне эскиза).
         let navigating = resp.dragged();
+        self.hover_face = None;
+        self.hover_edge = None;
         if self.sketch.is_none() {
-            self.hover_face = match resp.hover_pos() {
-                Some(pos) if !navigating => {
-                    let (o, d) = self.cam.ray(rect, pos);
-                    self.mesh.pick(o, d)
+            if let Some(pos) = resp.hover_pos().filter(|_| !navigating) {
+                let (o, d) = self.cam.ray(rect, pos);
+                let hit = self.mesh.pick_hit(o, d);
+                // Ребро рядом с курсором важнее грани под ним.
+                self.hover_edge = self.pick_edge(rect, pos, hit.map(|(_, t)| t));
+                if self.hover_edge.is_none() {
+                    self.hover_face = hit.map(|(face, _)| face);
                 }
-                _ => None,
-            };
+            }
             if resp.clicked() {
-                self.selection = match self.hover_face {
-                    Some(f) => Selection::Face(f),
-                    None => self.pick_base_plane(rect, resp.interact_pointer_pos()),
+                let ctrl = ui.input(|i| i.modifiers.command);
+                self.selection = match (self.hover_edge, self.hover_face) {
+                    (Some(e), _) => {
+                        let mut list = match &self.selection {
+                            Selection::Edges(list) if ctrl => list.clone(),
+                            _ => vec![],
+                        };
+                        match list.iter().position(|&i| i == e) {
+                            Some(at) => drop(list.remove(at)),
+                            None => list.push(e),
+                        }
+                        if list.is_empty() { Selection::None } else { Selection::Edges(list) }
+                    }
+                    (None, Some(f)) => Selection::Face(f),
+                    (None, None) => self.pick_base_plane(rect, resp.interact_pointer_pos()),
                 };
             }
-        } else {
-            self.hover_face = None;
         }
 
         // Тело — через OpenGL.
@@ -598,6 +695,7 @@ impl App {
             })),
         });
 
+        self.draw_edge_highlights(&painter, rect);
         self.draw_base_planes(&painter, rect);
         self.draw_sketches(&painter, rect);
         if let Some(mut edit) = self.sketch.take() {
@@ -606,6 +704,46 @@ impl App {
         }
         self.draw_axes(&painter, rect);
         self.dim_edit_popup(ui);
+    }
+
+    /// Видимое ребро в пределах нескольких пикселей от курсора.
+    /// `face_depth` — расстояние вдоль луча до грани под курсором (рёбра за ней считаем скрытыми).
+    fn pick_edge(&self, rect: Rect, pos: Pos2, face_depth: Option<f64>) -> Option<usize> {
+        let (origin, dir) = self.cam.ray(rect, pos);
+        // Допуск по глубине: курсор стоит не точно на ребре, а грань может быть наклонной.
+        let tolerance = 30.0 / self.cam.scale + 0.05;
+        let mut best: Option<(f32, usize)> = None;
+        for (index, edge) in self.mesh.edges.iter().enumerate() {
+            for w in edge.points.windows(2) {
+                let (a, b) = (self.cam.project(rect, w[0]), self.cam.project(rect, w[1]));
+                let dist = screen_segment_distance(a, b, pos);
+                if dist > 6.0 || best.is_some_and(|(d, _)| d <= dist) {
+                    continue;
+                }
+                let depth = ((w[0] + w[1]) * 0.5 - origin).dot(dir);
+                if face_depth.is_some_and(|t| depth > t + tolerance + (w[1] - w[0]).length() * 0.5) {
+                    continue;
+                }
+                best = Some((dist, index));
+            }
+        }
+        best.map(|(_, index)| index)
+    }
+
+    fn draw_edge_highlights(&self, painter: &Painter, rect: Rect) {
+        let draw = |index: usize, stroke: Stroke| {
+            if let Some(edge) = self.mesh.edges.get(index) {
+                painter.line(edge.points.iter().map(|p| self.cam.project(rect, *p)).collect(), stroke);
+            }
+        };
+        if let Selection::Edges(list) = &self.selection {
+            for &i in list {
+                draw(i, Stroke::new(3.0, Color32::from_rgb(60, 160, 255)));
+            }
+        }
+        if let Some(i) = self.hover_edge {
+            draw(i, Stroke::new(3.0, SELECT_COLOR));
+        }
     }
 
     fn base_plane_size(&self) -> f64 {
@@ -759,12 +897,37 @@ impl App {
 
         let Some(sketch) = self.part.sketch_mut(edit.id) else { return };
         let mut preview = None;
+        // Предпросмотр следующего сегмента контура (в координатах эскиза).
+        let mut chain_preview: Option<Vec<DVec2>> = None;
 
+        // Завершить рисование контура; контур из одной точки удаляется.
+        let finish_chain = |sketch: &mut Sketch, edit: &mut SketchEdit| {
+            if let Some(c) = edit.chain {
+                if matches!(sketch.shapes.get(c), Some(SketchShape::Path { points, .. }) if points.len() < 2) {
+                    sketch.shapes.remove(c);
+                    edit.selected = None;
+                }
+            }
+            edit.stop_chain();
+        };
+
+        let chain_tool = matches!(edit.tool, Tool::Line | Tool::Arc);
+        if !chain_tool && edit.chain.is_some() {
+            finish_chain(sketch, edit);
+        }
+        if edit.tool != Tool::Arc {
+            edit.arc_end = None;
+        }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             edit.drag_start = None;
-            edit.tool = Tool::Select;
+            if edit.chain.is_some() {
+                finish_chain(sketch, edit);
+            } else {
+                edit.tool = Tool::Select;
+            }
         }
         if no_focus && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+            edit.stop_chain();
             if let Some(i) = edit.selected.take().filter(|&i| i < sketch.shapes.len()) {
                 sketch.shapes.remove(i);
                 self.dim_edit = None;
@@ -772,7 +935,90 @@ impl App {
         }
 
         match edit.tool {
+            Tool::Line | Tool::Arc => {
+                let ends = |sketch: &Sketch, chain: usize| match sketch.shapes.get(chain) {
+                    Some(SketchShape::Path { points, .. }) if !points.is_empty() => {
+                        Some((points[0].pos(), points[points.len() - 1].pos(), points.len()))
+                    }
+                    _ => None,
+                };
+                // Рядом с началом контура курсор «прилипает» к нему — так контур замыкается.
+                let target = pointer.and_then(raw_at).map(|raw| match edit.chain.and_then(|c| ends(sketch, c)) {
+                    Some((first, _, n)) if n >= 2 && (first - raw).length() < 10.0 * px => first,
+                    _ => snap_pt(raw),
+                });
+
+                if let (true, Some(p)) = (resp.clicked(), target) {
+                    match edit.chain.and_then(|c| ends(sketch, c).map(|e| (c, e))) {
+                        None => {
+                            sketch.shapes.push(SketchShape::Path { points: vec![PathPoint::new(p)], closed: false });
+                            edit.chain = Some(sketch.shapes.len() - 1);
+                            edit.selected = edit.chain;
+                            edit.arc_end = None;
+                        }
+                        Some((c, (first, last, n))) => {
+                            let SketchShape::Path { points, closed } = &mut sketch.shapes[c] else { unreachable!() };
+                            let closes = |end: DVec2| n >= 2 && (end - first).length() < 1e-9;
+                            if edit.tool == Tool::Line {
+                                if closes(p) {
+                                    *closed = true;
+                                    edit.stop_chain();
+                                } else if (p - last).length() > MIN_SIZE {
+                                    points.push(PathPoint::new(p));
+                                }
+                            } else if let Some(end) = edit.arc_end.take() {
+                                points[n - 1].bulge = bulge_through(last, end, p);
+                                if closes(end) {
+                                    *closed = true;
+                                    edit.stop_chain();
+                                } else {
+                                    points.push(PathPoint::new(end));
+                                }
+                            } else if (p - last).length() > MIN_SIZE {
+                                edit.arc_end = Some(p);
+                            }
+                        }
+                    }
+                }
+                if resp.double_clicked() || (no_focus && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    finish_chain(sketch, edit);
+                }
+
+                if let (Some((_, last, _)), Some(t)) = (edit.chain.and_then(|c| ends(sketch, c)), target) {
+                    let mut pts = vec![last];
+                    match edit.arc_end {
+                        Some(end) => segment_points(last, end, bulge_through(last, end, t), &mut pts),
+                        None => pts.push(t),
+                    }
+                    chain_preview = Some(pts);
+                }
+            }
             Tool::Select => {
+                // Сначала пробуем схватить точку контура, иначе — фигуру целиком.
+                if resp.drag_started_by(primary) {
+                    edit.drag_vertex = press.and_then(raw_at).and_then(|p| {
+                        sketch.shapes.iter().enumerate().find_map(|(si, s)| match s {
+                            SketchShape::Path { points, .. } => {
+                                points.iter().position(|q| (q.pos() - p).length() < 8.0 * px).map(|pi| (si, pi))
+                            }
+                            _ => None,
+                        })
+                    });
+                }
+                if let Some((si, pi)) = edit.drag_vertex {
+                    edit.selected = Some(si);
+                    if let (Some(cur), Some(SketchShape::Path { points, .. })) =
+                        (pointer.and_then(raw_at).map(snap_pt), sketch.shapes.get_mut(si))
+                    {
+                        if let Some(point) = points.get_mut(pi) {
+                            (point.x, point.y) = (cur.x, cur.y);
+                        }
+                    }
+                    if resp.drag_stopped_by(primary) || !resp.dragged_by(primary) {
+                        edit.drag_vertex = None;
+                    }
+                }
+                let dragging_vertex = edit.drag_vertex.is_some();
                 let pick = |sketch: &Sketch, p: DVec2| {
                     sketch
                         .shapes
@@ -783,7 +1029,9 @@ impl App {
                         .min_by(|a, b| a.1.total_cmp(&b.1))
                         .map(|(i, _)| i)
                 };
-                if resp.drag_started_by(primary) {
+                if dragging_vertex {
+                    edit.move_last = None;
+                } else if resp.drag_started_by(primary) {
                     if let Some(p) = press.and_then(raw_at) {
                         edit.selected = pick(sketch, p);
                         edit.move_last = edit.selected.map(|_| snap_pt(p));
@@ -842,6 +1090,20 @@ impl App {
             let color = if edit.selected == Some(i) { SELECT_COLOR } else { SKETCH_COLOR };
             draw_shape(painter, &cam, rect, &plane, s, Stroke::new(2.0, color));
             draw_dimensions(painter, &cam, rect, &plane, s, Some(i), &mut labels);
+            if let SketchShape::Path { points, closed } = s {
+                for (pi, p) in points.iter().enumerate() {
+                    let pos = cam.project(rect, plane.to_world(p.pos()));
+                    painter.circle_filled(pos, 3.0, color);
+                    // Кольцо на первой точке незамкнутого контура — подсказка, куда щёлкнуть для замыкания.
+                    if pi == 0 && !closed {
+                        painter.circle_stroke(pos, 7.0, Stroke::new(1.0, color));
+                    }
+                }
+            }
+        }
+        if let Some(pts) = chain_preview {
+            let line: Vec<Pos2> = pts.iter().map(|p| cam.project(rect, plane.to_world(*p))).collect();
+            painter.line(line, Stroke::new(1.5, Color32::WHITE));
         }
         if let Some(s) = &preview {
             draw_shape(painter, &cam, rect, &plane, s, Stroke::new(1.5, Color32::WHITE));
@@ -851,9 +1113,9 @@ impl App {
         // Двойной щелчок по размеру — ввод значения.
         if resp.double_clicked() {
             if let Some(l) = pointer.and_then(|p| labels.iter().find(|l| l.rect.expand(4.0).contains(p))) {
-                let value = match (sketch.shapes[l.shape], l.kind) {
-                    (SketchShape::Rect { w, .. }, DimKind::Width) => w,
-                    (SketchShape::Rect { h, .. }, DimKind::Height) => h,
+                let value = match (&sketch.shapes[l.shape], l.kind) {
+                    (SketchShape::Rect { w, .. }, DimKind::Width) => *w,
+                    (SketchShape::Rect { h, .. }, DimKind::Height) => *h,
                     (SketchShape::Circle { r, .. }, _) => r * 2.0,
                     _ => 0.0,
                 };
@@ -924,6 +1186,8 @@ fn shapes_ui(ui: &mut egui::Ui, sketch: &mut Sketch, selected: Option<usize>) ->
                 let title = match shape {
                     SketchShape::Rect { .. } => "Прямоугольник",
                     SketchShape::Circle { .. } => "Окружность",
+                    SketchShape::Path { closed: true, .. } => "Контур",
+                    SketchShape::Path { closed: false, .. } => "Контур (не замкнут)",
                 };
                 if selected == Some(i) {
                     ui.colored_label(SELECT_COLOR, title);
@@ -955,6 +1219,12 @@ fn shapes_ui(ui: &mut egui::Ui, sketch: &mut Sketch, selected: Option<usize>) ->
                         row(ui, "X центра", cx, -1.0e5);
                         row(ui, "Y центра", cy, -1.0e5);
                     }
+                    SketchShape::Path { points, .. } => {
+                        for (pi, p) in points.iter_mut().enumerate() {
+                            row(ui, &format!("Точка {} — X", pi + 1), &mut p.x, -1.0e5);
+                            row(ui, &format!("Точка {} — Y", pi + 1), &mut p.y, -1.0e5);
+                        }
+                    }
                 }
             });
         });
@@ -979,34 +1249,57 @@ fn draw_dimensions(
     let px = 1.0 / cam.scale;
     let to_screen = |x: f64, y: f64| cam.project(rect, plane.to_world(DVec2::new(x, y)));
     let stroke = Stroke::new(1.0, Color32::from_gray(170));
-    let mut label = |pos: Pos2, text: String, kind: DimKind| {
-        let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), Color32::WHITE);
+    // `kind` задан только у размеров, которые можно править двойным щелчком.
+    let mut label = |pos: Pos2, text: String, kind: Option<DimKind>| {
+        let color = if kind.is_some() { Color32::WHITE } else { Color32::from_gray(190) };
+        let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), color);
         let r = Align2::CENTER_CENTER.anchor_size(pos, galley.size());
         painter.rect_filled(r.expand2(Vec2::new(4.0, 2.0)), 3.0, Color32::from_rgba_unmultiplied(20, 24, 32, 230));
-        painter.galley(r.min, galley, Color32::WHITE);
-        if let Some(shape) = index {
+        painter.galley(r.min, galley, color);
+        if let (Some(shape), Some(kind)) = (index, kind) {
             labels.push(DimLabel { rect: r, shape, kind });
         }
     };
     match *shape {
+        SketchShape::Path { ref points, closed } => {
+            // Справочные размеры сегментов: длина отрезка или радиус дуги.
+            let n = points.len();
+            let count = if closed { n } else { n.saturating_sub(1) };
+            for i in 0..count {
+                let (a, b) = (points[i].pos(), points[(i + 1) % n].pos());
+                let chord = b - a;
+                if chord.length() < 1e-9 {
+                    continue;
+                }
+                let normal = DVec2::new(chord.y, -chord.x) / chord.length();
+                let bulge = points[i].bulge;
+                let (anchor, text) = if bulge == 0.0 {
+                    ((a + b) * 0.5 + normal * (14.0 * px), fmt_mm(chord.length()))
+                } else {
+                    let mid = (a + b) * 0.5 + normal * (bulge * chord.length() * 0.5);
+                    (mid + normal * (16.0 * px * bulge.signum()), format!("R{}", fmt_mm(arc_radius(a, b, bulge))))
+                };
+                label(to_screen(anchor.x, anchor.y), text, None);
+            }
+        }
         SketchShape::Rect { x, y, w, h } => {
             let (off, ext) = (24.0 * px, 30.0 * px);
             // Ширина — под нижней стороной.
             painter.line_segment([to_screen(x, y), to_screen(x, y - ext)], stroke);
             painter.line_segment([to_screen(x + w, y), to_screen(x + w, y - ext)], stroke);
             painter.line_segment([to_screen(x, y - off), to_screen(x + w, y - off)], stroke);
-            label(to_screen(x + w / 2.0, y - off), fmt_mm(w), DimKind::Width);
+            label(to_screen(x + w / 2.0, y - off), fmt_mm(w), Some(DimKind::Width));
             // Высота — слева.
             painter.line_segment([to_screen(x, y), to_screen(x - ext, y)], stroke);
             painter.line_segment([to_screen(x, y + h), to_screen(x - ext, y + h)], stroke);
             painter.line_segment([to_screen(x - off, y), to_screen(x - off, y + h)], stroke);
-            label(to_screen(x - off, y + h / 2.0), fmt_mm(h), DimKind::Height);
+            label(to_screen(x - off, y + h / 2.0), fmt_mm(h), Some(DimKind::Height));
         }
         SketchShape::Circle { cx, cy, r } => {
             let k = std::f64::consts::FRAC_1_SQRT_2;
             let far = r + 30.0 * px;
             painter.line_segment([to_screen(cx + r * k, cy + r * k), to_screen(cx + far * k, cy + far * k)], stroke);
-            label(to_screen(cx + far * k, cy + far * k), format!("Ø{}", fmt_mm(r * 2.0)), DimKind::Diameter);
+            label(to_screen(cx + far * k, cy + far * k), format!("Ø{}", fmt_mm(r * 2.0)), Some(DimKind::Diameter));
         }
     }
 }
@@ -1025,9 +1318,9 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.sketch.is_some() {
-                    ui.weak("Эскиз: протяните левой кнопкой, чтобы нарисовать фигуру · двойной щелчок по размеру — изменить · Del — удалить");
+                    ui.weak("Эскиз: «Линия» и «Дуга» — щелчками, щелчок по первой точке замыкает контур · прямоугольник и окружность — протяжкой · двойной щелчок по размеру — изменить · Esc — закончить · Del — удалить");
                 } else {
-                    ui.weak("Колесо — масштаб · средняя кнопка — вращение · правая — сдвиг · щелчок — выбор грани");
+                    ui.weak("Колесо — масштаб · средняя кнопка — вращение · правая — сдвиг · щелчок — выбор грани или ребра (Ctrl — несколько рёбер)");
                 }
                 if !self.status.is_empty() {
                     ui.separator();
@@ -1035,8 +1328,8 @@ impl eframe::App for App {
                 }
             });
         });
-        egui::Panel::left("tree").default_size(210.0).show(ui, |ui| self.tree(ui));
-        egui::Panel::right("properties").default_size(250.0).show(ui, |ui| {
+        egui::Panel::left("tree").exact_size(210.0).resizable(false).show(ui, |ui| self.tree(ui));
+        egui::Panel::right("properties").exact_size(270.0).resizable(false).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.properties(ui));
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));

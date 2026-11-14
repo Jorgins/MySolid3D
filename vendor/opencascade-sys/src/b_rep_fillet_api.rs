@@ -67,6 +67,14 @@ mod inner {
         pub fn Shape(self: Pin<&mut BRepFilletAPI_MakeChamfer>) -> &TopoDS_Shape;
         pub fn Build(self: Pin<&mut BRepFilletAPI_MakeChamfer>, progress: &Message_ProgressRange);
         pub fn IsDone(self: &BRepFilletAPI_MakeChamfer) -> bool;
+
+        /// Null при ошибке построения (исключения OCCT перехватываются на стороне C++).
+        pub fn BRepFilletAPI_MakeFillet_build_checked(
+            maker: Pin<&mut BRepFilletAPI_MakeFillet>,
+        ) -> UniquePtr<TopoDS_Shape>;
+        pub fn BRepFilletAPI_MakeChamfer_build_checked(
+            maker: Pin<&mut BRepFilletAPI_MakeChamfer>,
+        ) -> UniquePtr<TopoDS_Shape>;
     }
 }
 
