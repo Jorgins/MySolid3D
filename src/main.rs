@@ -1,5 +1,5 @@
-// В релизной сборке не открываем консольное окно.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Не открываем чёрное консольное окно рядом с программой.
+#![windows_subsystem = "windows"]
 
 mod app;
 mod camera;
