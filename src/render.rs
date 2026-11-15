@@ -27,6 +27,7 @@ flat in float v_face;
 flat in vec3 v_color;
 uniform float u_hover;
 uniform float u_selected;
+uniform float u_alpha;
 out vec4 o_color;
 void main() {
     vec3 n = normalize(v_normal);
@@ -49,7 +50,7 @@ void main() {
     } else if (abs(v_face - u_hover) < 0.5) {
         c = mix(c, vec3(1.0, 0.72, 0.25), 0.35);
     }
-    o_color = vec4(c, 1.0);
+    o_color = vec4(c, u_alpha);
 }
 "#;
 
@@ -73,8 +74,38 @@ pub struct DrawParams {
     pub normal_mat: [f32; 9],
     pub hover: Option<usize>,
     pub selected: Option<usize>,
-    /// Каркасный режим: грани не рисуются, видны только рёбра.
-    pub wireframe: bool,
+    pub mode: RenderMode,
+}
+
+/// Режим отрисовки тела.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum RenderMode {
+    /// Закрашенное тело с рёбрами.
+    #[default]
+    Solid,
+    /// Закрашенное тело без линий рёбер.
+    SolidNoEdges,
+    /// Только видимые рёбра; грани не закрашены, но скрывают то, что за ними.
+    HiddenLines,
+    /// Только рёбра, видны все (в том числе скрытые за деталью).
+    Wireframe,
+    /// Полупрозрачное тело: сквозь него видны все рёбра.
+    XRay,
+}
+
+impl RenderMode {
+    pub const ALL: [RenderMode; 5] =
+        [RenderMode::Solid, RenderMode::SolidNoEdges, RenderMode::HiddenLines, RenderMode::Wireframe, RenderMode::XRay];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RenderMode::Solid => "Тело с рёбрами",
+            RenderMode::SolidNoEdges => "Тело без рёбер",
+            RenderMode::HiddenLines => "Скрытые линии убраны",
+            RenderMode::Wireframe => "Каркас",
+            RenderMode::XRay => "Прозрачное тело",
+        }
+    }
 }
 
 pub struct Renderer {
@@ -221,11 +252,36 @@ impl Renderer {
             let id = |v: Option<usize>| v.map_or(-10.0, |i| i as f32);
             gl.uniform_1_f32(loc("u_hover").as_ref(), id(p.hover));
             gl.uniform_1_f32(loc("u_selected").as_ref(), id(p.selected));
+            let xray = p.mode == RenderMode::XRay;
+            gl.uniform_1_f32(loc("u_alpha").as_ref(), if xray { 0.28 } else { 1.0 });
             gl.bind_vertex_array(Some(self.mesh_vao));
-            if !p.wireframe {
+            if xray {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+            }
+            // «Скрытые линии»: грани пишут только глубину — цвета не видно, но рёбра за ними пропадают.
+            if p.mode == RenderMode::HiddenLines {
+                gl.color_mask(false, false, false, false);
+            }
+            if p.mode != RenderMode::Wireframe {
                 gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
             }
+            if p.mode == RenderMode::HiddenLines {
+                gl.color_mask(true, true, true, true);
+            }
+            if xray {
+                gl.disable(glow::BLEND);
+                gl.depth_mask(true);
+            }
             gl.disable(glow::POLYGON_OFFSET_FILL);
+            if p.mode == RenderMode::SolidNoEdges {
+                gl.bind_vertex_array(None);
+                gl.use_program(None);
+                gl.disable(glow::DEPTH_TEST);
+                gl.enable(glow::BLEND);
+                return;
+            }
 
             gl.use_program(Some(self.edge_program));
             let loc = gl.get_uniform_location(self.edge_program, "u_view_proj");

@@ -5,7 +5,7 @@ use crate::model::{
     bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Part, PathPoint, Plane, Relation,
     RenderMesh, Sketch, SketchImage, SketchShape, TreeItem, MIN_SIZE,
 };
-use crate::render::{DrawParams, Renderer};
+use crate::render::{DrawParams, RenderMode, Renderer};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Painter, PointerButton, Pos2, Rect, Response, Stroke, Vec2,
 };
@@ -498,8 +498,8 @@ pub struct App {
     grid_step: f64,
     status: String,
     need_fit: bool,
-    /// Каркасный режим показа.
-    wireframe: bool,
+    /// Как рисуется тело: с рёбрами, каркас, прозрачное и т.д.
+    render_mode: RenderMode,
     /// Область 3D-вида на прошлом кадре (для кнопок масштаба).
     view_rect: Rect,
     /// Загруженная картинка-подложка: (путь, текстура и отношение высоты к ширине).
@@ -603,7 +603,7 @@ impl App {
             grid_step: 1.0,
             status: String::new(),
             need_fit: false,
-            wireframe: false,
+            render_mode: RenderMode::Solid,
             view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0)),
             image_tex: None,
             undo: Vec::new(),
@@ -1262,12 +1262,22 @@ impl App {
             });
             ui.weak("Чем больше угол, тем сильнее перспектива.\nВ эскизе вид всегда параллельный.");
         });
-        if tool_button(ui, &self.icons.solid_view, "Показывать грани (тело)", !self.wireframe) {
-            self.wireframe = false;
+        if tool_button(ui, &self.icons.solid_view, "Тело с рёбрами", self.render_mode == RenderMode::Solid) {
+            self.render_mode = RenderMode::Solid;
         }
-        if tool_button(ui, &self.icons.wireframe, "Каркас: только рёбра", self.wireframe) {
-            self.wireframe = true;
+        if tool_button(ui, &self.icons.wireframe, "Каркас: только рёбра", self.render_mode == RenderMode::Wireframe) {
+            self.render_mode = RenderMode::Wireframe;
         }
+        ui.menu_button("Отрисовка", |ui| {
+            for mode in RenderMode::ALL {
+                if ui.selectable_label(self.render_mode == mode, mode.name()).clicked() {
+                    self.render_mode = mode;
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text(format!("Режим отрисовки: {}", self.render_mode.name()));
     }
 
     // ---------- картинка-подложка и операции эскиза ----------
@@ -1872,7 +1882,7 @@ impl App {
                 Selection::Face(i) => Some(i),
                 _ => None,
             },
-            wireframe: self.wireframe,
+            mode: self.render_mode,
         };
         let renderer = self.renderer.clone();
         painter.add(egui::PaintCallback {
