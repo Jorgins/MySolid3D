@@ -79,6 +79,8 @@ struct SketchEdit {
     labels: Vec<(Rect, usize)>,
     /// Размер (номер в `Sketch::dims`), который сейчас перетаскивают за подпись.
     drag_label: Option<usize>,
+    /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
+    line_menu: Option<(usize, usize)>,
     /// Открытое окно операции над выбранной фигурой и введённые в нём параметры.
     op: Option<OpKind>,
     params: OpParams,
@@ -99,6 +101,7 @@ impl SketchEdit {
             placing: None,
             labels: Vec::new(),
             drag_label: None,
+            line_menu: None,
             op: None,
             params: OpParams::default(),
         }
@@ -544,8 +547,26 @@ fn fmt_mm(v: f64) -> String {
 }
 
 fn draw_shape(painter: &Painter, cam: &Camera, rect: Rect, plane: &Plane, s: &SketchShape, stroke: Stroke) {
-    let pts: Vec<Pos2> = s.outline().iter().map(|p| cam.project(rect, plane.to_world(*p))).collect();
-    painter.line(pts, stroke);
+    let screen = |q: DVec2| cam.project(rect, plane.to_world(q));
+    let has_construction = (0..).map_while(|i| s.segment(i).map(|_| i)).any(|i| s.segment_construction(i));
+    if !has_construction {
+        let pts: Vec<Pos2> = s.outline().iter().map(|p| screen(*p)).collect();
+        painter.line(pts, stroke);
+        return;
+    }
+    // Линии построения рисуются штрихами, остальные сегменты — сплошными.
+    let mut i = 0;
+    while let Some((a, b, bulge)) = s.segment(i) {
+        let mut pts = vec![a];
+        segment_points(a, b, bulge, &mut pts);
+        let line: Vec<Pos2> = pts.into_iter().map(screen).collect();
+        if s.segment_construction(i) {
+            painter.extend(egui::Shape::dashed_line(&line, Stroke::new(stroke.width * 0.75, stroke.color), 8.0, 5.0));
+        } else {
+            painter.line(line, stroke);
+        }
+        i += 1;
+    }
 }
 
 /// Расстояние в пикселях от точки до отрезка на экране.
@@ -802,7 +823,7 @@ impl App {
             while let Some(i) = sketch.shapes.iter().position(stub) {
                 sketch.remove_shape(i);
             }
-            if sketch.shapes.iter().any(|s| !s.is_closed()) {
+            if sketch.shapes.iter().any(|s| !s.is_closed() && !s.is_construction()) {
                 self.status = "В эскизе остался незамкнутый контур — вытянуть его не получится".into();
             }
         }
@@ -1879,9 +1900,11 @@ impl App {
         if self.sketch.is_some() || self.mesh.indices.is_empty() {
             return;
         }
-        let faces: Vec<DVec3> = match &self.selection {
-            Selection::Face(i) => self.mesh.faces.get(*i).map(|f| f.origin).into_iter().collect(),
-            Selection::Faces(list) => list.iter().filter_map(|&i| self.mesh.faces.get(i)).map(|f| f.origin).collect(),
+        let faces: Vec<(DVec3, DVec3)> = match &self.selection {
+            Selection::Face(i) => self.mesh.faces.get(*i).map(|f| (f.origin, f.normal)).into_iter().collect(),
+            Selection::Faces(list) => {
+                list.iter().filter_map(|&i| self.mesh.faces.get(i)).map(|f| (f.origin, f.normal)).collect()
+            }
             _ => vec![],
         };
         // Выбрали грань — по умолчанию красится она; сняли выбор — вся деталь. Переключатель решает вручную.
@@ -1956,8 +1979,8 @@ impl App {
             } else if faces.is_empty() {
                 self.status = "Сначала выберите грань (Ctrl+щелчок — несколько) или переключитесь на «Деталь»".into();
             } else {
-                for point in faces {
-                    self.part.set_face_color(point, color);
+                for (point, normal) in faces {
+                    self.part.set_face_color(point, normal, color);
                 }
                 // Снимаем выделение — иначе подсветка выбора закрывает новый цвет.
                 self.selection = Selection::None;
@@ -1976,9 +1999,18 @@ impl App {
     /// Видимое ребро в пределах нескольких пикселей от курсора; скрытые деталью рёбра не выбираются.
     fn pick_edge(&self, rect: Rect, pos: Pos2) -> Option<usize> {
         let mut best: Option<(f32, usize)> = None;
+        let proj = self.cam.projector(rect);
         for (index, edge) in self.mesh.edges.iter().enumerate() {
-            for w in edge.points.windows(2) {
-                let (a, b) = (self.cam.project(rect, w[0]), self.cam.project(rect, w[1]));
+            let screen: Vec<Pos2> = edge.points.iter().map(|p| proj.project(*p)).collect();
+            // Ломаная целиком далеко от курсора — отрезки не проверяем.
+            let (lo, hi) = screen.iter().fold((Pos2::new(f32::MAX, f32::MAX), Pos2::new(f32::MIN, f32::MIN)), |(lo, hi), p| {
+                (Pos2::new(lo.x.min(p.x), lo.y.min(p.y)), Pos2::new(hi.x.max(p.x), hi.y.max(p.y)))
+            });
+            if pos.x < lo.x - 6.0 || pos.x > hi.x + 6.0 || pos.y < lo.y - 6.0 || pos.y > hi.y + 6.0 {
+                continue;
+            }
+            for (k, w) in edge.points.windows(2).enumerate() {
+                let (a, b) = (screen[k], screen[k + 1]);
                 let dist = screen_segment_distance(a, b, pos);
                 if dist > 6.0 || best.is_some_and(|(d, _)| d <= dist) {
                     continue;
@@ -2000,6 +2032,7 @@ impl App {
     /// `budget` ограничивает число проверок за кадр; когда он кончился, остальное рисуется целиком.
     fn draw_visible_polyline(&self, painter: &Painter, rect: Rect, pts: &[DVec3], stroke: Stroke, budget: &mut usize) {
         let mut run: Vec<Pos2> = Vec::new();
+        let proj = self.cam.projector(rect);
         for w in pts.windows(2) {
             let hidden = *budget > 0 && {
                 *budget -= 1;
@@ -2013,9 +2046,9 @@ impl App {
                 continue;
             }
             if run.is_empty() {
-                run.push(self.cam.project(rect, w[0]));
+                run.push(proj.project(w[0]));
             }
-            run.push(self.cam.project(rect, w[1]));
+            run.push(proj.project(w[1]));
         }
         if run.len() > 1 {
             painter.line(run, stroke);
@@ -2163,7 +2196,8 @@ impl App {
         // Линии пересечения базовых плоскостей — едва заметным пунктиром в обе стороны от начала координат.
         let reach = self.cam.target.length() + 2.0 * rect.width().max(rect.height()) as f64 / self.cam.scale;
         for (axis, _, color) in axes {
-            let ends = [self.cam.project(rect, axis * -reach), self.cam.project(rect, axis * reach)];
+            let Some((a, b)) = self.cam.clip_to_view(rect, axis * -reach, axis * reach) else { continue };
+            let ends = [self.cam.project(rect, a), self.cam.project(rect, b)];
             if ends.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
                 painter.extend(egui::Shape::dashed_line(&ends, Stroke::new(1.0, color.gamma_multiply(0.3)), 7.0, 6.0));
             }
@@ -2532,6 +2566,39 @@ impl App {
             Tool::Dimension => {}
         }
 
+        // Правая кнопка по отрезку: линия построения, горизонтальность, вертикальность.
+        if resp.secondary_clicked() && !dragging_label {
+            edit.line_menu = pointer.and_then(raw_at).and_then(|p| sketch.nearest_line(p, 8.0 * px));
+            edit.selected = edit.line_menu.map(|(s, _)| s).or(edit.selected);
+        }
+        let mut menu_error = None;
+        resp.context_menu(|ui| {
+            let Some((si, seg)) = edit.line_menu else {
+                ui.close();
+                return;
+            };
+            let on = sketch.shapes.get(si).is_some_and(|s| s.segment_construction(seg));
+            let mut result = Ok(());
+            if ui.button(if on { "Сделать обычной линией" } else { "Линия построения (штриховая)" }).clicked() {
+                result = sketch.set_construction(si, seg, !on);
+                ui.close();
+            }
+            if ui.button("Горизонтальная").clicked() {
+                result = sketch.make_axis(si, seg, true);
+                ui.close();
+            }
+            if ui.button("Вертикальная").clicked() {
+                result = sketch.make_axis(si, seg, false);
+                ui.close();
+            }
+            if let Err(e) = result {
+                menu_error = Some(e);
+            }
+        });
+        if let Some(e) = menu_error {
+            self.status = e;
+        }
+
         // Отрисовка фигур и поставленных пользователем размеров.
         for (i, s) in sketch.shapes.iter().enumerate() {
             let color = if edit.selected == Some(i) { SELECT_COLOR } else { SKETCH_COLOR };
@@ -2579,7 +2646,7 @@ impl App {
             let pos = cam.project(rect, plane.to_world(q));
             rect.contains(pos).then_some(pos)
         };
-        let drawing = matches!(edit.tool, Tool::Line | Tool::Arc | Tool::Rect | Tool::Circle);
+        let drawing = matches!(edit.tool, Tool::Line | Tool::Arc | Tool::Rect | Tool::Circle | Tool::Select);
         if drawing && self.snap_objects {
             // Чужие точки (более ранние эскизы, тело) — бледные, точки этого эскиза — белые.
             for pos in extra_points.iter().filter_map(|q| dot_at(*q)).take(3000) {

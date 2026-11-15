@@ -60,11 +60,14 @@ pub struct PathPoint {
     pub y: f64,
     #[serde(default)]
     pub bulge: f64,
+    /// Сегмент от этой точки — линия построения (штриховая): в тело не входит.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub construction: bool,
 }
 
 impl PathPoint {
     pub fn new(p: DVec2) -> Self {
-        Self { x: p.x, y: p.y, bulge: 0.0 }
+        Self { x: p.x, y: p.y, bulge: 0.0, construction: false }
     }
 
     pub fn pos(&self) -> DVec2 {
@@ -192,6 +195,23 @@ impl SketchShape {
                 (i < count).then(|| (points[i].pos(), points[(i + 1) % n].pos(), points[i].bulge))
             }
         }
+    }
+
+    /// Сегмент `i` — линия построения.
+    pub fn segment_construction(&self, i: usize) -> bool {
+        matches!(self, SketchShape::Path { points, .. } if points.get(i).is_some_and(|p| p.construction))
+    }
+
+    /// Вся фигура состоит из линий построения: в тело она не входит.
+    pub fn is_construction(&self) -> bool {
+        let mut i = 0;
+        while self.segment(i).is_some() {
+            if !self.segment_construction(i) {
+                return false;
+            }
+            i += 1;
+        }
+        i > 0
     }
 
     /// Превращает прямоугольник в обычный контур из четырёх отрезков (для поворота, скругления углов).
@@ -345,7 +365,7 @@ impl SketchShape {
                     } else {
                         return Err("углы между дугой и соседним сегментом пока не смещаются — скруглите их".into());
                     };
-                    out.push(PathPoint { x: pos.x, y: pos.y, bulge: points[i].bulge });
+                    out.push(PathPoint { x: pos.x, y: pos.y, bulge: points[i].bulge, construction: points[i].construction });
                 }
                 // Сегмент, развернувшийся в обратную сторону, — признак того, что контур схлопнулся.
                 let flipped = (0..n).any(|i| {
@@ -405,7 +425,7 @@ impl SketchShape {
                 // Дуга поворачивает в ту же сторону, что и контур в этом углу.
                 ((std::f64::consts::PI - angle) / 4.0).tan().copysign((-u1).perp_dot(u2))
             };
-            points[i] = PathPoint { x: p1.x, y: p1.y, bulge };
+            points[i] = PathPoint { x: p1.x, y: p1.y, bulge, construction: points[i].construction };
             points.insert(i + 1, PathPoint::new(p2));
             Ok(())
         };
@@ -579,15 +599,17 @@ pub struct SketchImage {
 impl Sketch {
     /// Тела-призмы из контуров эскиза; вложенные контуры становятся отверстиями.
     fn prisms(&self, dir: DVec3) -> Result<Vec<Shape>, String> {
-        if self.shapes.is_empty() {
+        // Линии построения в тело не входят.
+        let shapes: Vec<&SketchShape> = self.shapes.iter().filter(|s| !s.is_construction()).collect();
+        if shapes.is_empty() {
             return Err("эскиз пуст".into());
         }
-        if self.shapes.iter().any(|s| !s.is_closed()) {
+        if shapes.iter().any(|s| !s.is_closed()) {
             return Err("в эскизе есть незамкнутый контур — завершите его щелчком по первой точке".into());
         }
-        let n = self.shapes.len();
+        let n = shapes.len();
         let depth: Vec<usize> = (0..n)
-            .map(|i| (0..n).filter(|&j| j != i && self.shapes[j].contains(&self.shapes[i])).count())
+            .map(|i| (0..n).filter(|&j| j != i && shapes[j].contains(shapes[i])).count())
             .collect();
         let dir_unit = dir.normalize();
         // Отверстия вытягиваем с запасом в обе стороны, чтобы булева операция была устойчивой.
@@ -596,11 +618,11 @@ impl Sketch {
 
         let mut out = Vec::new();
         for i in (0..n).filter(|&i| depth[i] % 2 == 0) {
-            let face = Face::from_wire(&self.shapes[i].wire(&self.plane)?);
+            let face = Face::from_wire(&shapes[i].wire(&self.plane)?);
             let mut solid: Shape = face.extrude(dir).into();
             for k in 0..n {
-                if depth[k] == depth[i] + 1 && self.shapes[i].contains(&self.shapes[k]) {
-                    let hole_face = Face::from_wire(&self.shapes[k].wire(&hole_plane)?);
+                if depth[k] == depth[i] + 1 && shapes[i].contains(shapes[k]) {
+                    let hole_face = Face::from_wire(&shapes[k].wire(&hole_plane)?);
                     let hole: Shape = hole_face.extrude(hole_dir).into();
                     solid = solid.subtract(&hole).shape;
                 }
@@ -856,6 +878,54 @@ impl Sketch {
             DimRef::Circle(_) => self.dim_value(&Dim::Size(r)).map(|_| Dim::Size(r)),
             _ => None,
         }
+    }
+
+    /// Прямой отрезок рядом с точкой `p`: (фигура, номер сегмента).
+    pub fn nearest_line(&self, p: DVec2, tol: f64) -> Option<(usize, usize)> {
+        let mut best: Option<(f64, (usize, usize))> = None;
+        for (s, shape) in self.shapes.iter().enumerate() {
+            let mut i = 0;
+            while let Some((a, b, bulge)) = shape.segment(i) {
+                let d = segment_distance(a, b, p);
+                if bulge == 0.0 && d < tol && best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, (s, i)));
+                }
+                i += 1;
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    /// Делает отрезок линией построения или возвращает его в контур.
+    pub fn set_construction(&mut self, shape: usize, seg: usize, on: bool) -> Result<(), String> {
+        let sh = self.shapes.get_mut(shape).ok_or(DIM_GONE)?;
+        sh.segment(seg).ok_or(DIM_GONE)?;
+        sh.make_path();
+        let SketchShape::Path { points, .. } = sh else { return Err(DIM_GONE.into()) };
+        points[seg].construction = on;
+        Ok(())
+    }
+
+    /// Делает отрезок горизонтальным или вертикальным: его конец уходит на ось, длина сохраняется.
+    pub fn make_axis(&mut self, shape: usize, seg: usize, horizontal: bool) -> Result<(), String> {
+        let sh = self.shapes.get_mut(shape).ok_or(DIM_GONE)?;
+        let (a, b, bulge) = sh.segment(seg).ok_or(DIM_GONE)?;
+        if bulge != 0.0 {
+            return Err("это дуга, а не отрезок".into());
+        }
+        let d = b - a;
+        let len = d.length();
+        let dir = if horizontal { DVec2::new(d.x.signum_or(1.0), 0.0) } else { DVec2::new(0.0, d.y.signum_or(1.0)) };
+        let end = a + dir * len;
+        if (end - b).length() < 1e-12 {
+            return Ok(());
+        }
+        sh.make_path();
+        let SketchShape::Path { points, .. } = sh else { return Err(DIM_GONE.into()) };
+        let n = points.len();
+        let j = (seg + 1) % n;
+        (points[j].x, points[j].y) = (end.x, end.y);
+        Ok(())
     }
 
     /// Элемент эскиза рядом с точкой `p`; точки важнее линий.
@@ -1309,6 +1379,9 @@ const SELECTED_FACE: Rgb = [51, 158, 255];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaceColor {
     pub point: DVec3,
+    /// Нормаль грани при покраске (нулевая в старых файлах): после правки цвет ищет грань с той же нормалью.
+    #[serde(default)]
+    pub normal: DVec3,
     pub color: Rgb,
 }
 
@@ -1404,24 +1477,43 @@ impl Part {
     }
 
     /// Красит грань с центром `point`; `None` возвращает ей цвет детали.
-    pub fn set_face_color(&mut self, point: DVec3, color: Option<Rgb>) {
+    pub fn set_face_color(&mut self, point: DVec3, normal: DVec3, color: Option<Rgb>) {
         self.face_colors.retain(|c| (c.point - point).length() > FACE_MATCH);
         if let Some(color) = color {
-            self.face_colors.push(FaceColor { point, color });
+            self.face_colors.push(FaceColor { point, normal, color });
         }
+    }
+
+    /// Цвет каждой грани сетки, если её красили. Грань после правки размеров сдвигается,
+    /// поэтому цвет достаётся ближайшей грани с той же нормалью, а не только совпавшей по точке.
+    fn painted_faces(&self, mesh: &RenderMesh) -> Vec<Option<Rgb>> {
+        let mut out = vec![None; mesh.faces.len()];
+        let reach = mesh.bounds.map_or(FACE_MATCH, |(lo, hi)| ((hi - lo).length() * 0.5).max(FACE_MATCH));
+        for c in &self.face_colors {
+            let known = c.normal.length_squared() > 0.5;
+            let best = mesh
+                .faces
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !known || f.normal.normalize_or_zero().dot(c.normal.normalize_or_zero()) > 0.95)
+                .map(|(i, f)| (i, (c.point - f.origin).length()))
+                .filter(|(_, d)| *d <= reach)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((i, _)) = best {
+                out[i] = Some(c.color);
+            }
+        }
+        out
     }
 
     /// Цвета вершин сетки (r, g, b на вершину) с учётом цвета детали и раскрашенных граней.
     /// Грани из `selected` подкрашиваются цветом выделения.
     pub fn vertex_colors(&self, mesh: &RenderMesh, selected: &[usize]) -> Vec<f32> {
         let body = self.color.unwrap_or(DEFAULT_COLOR);
-        let faces: Vec<Rgb> = mesh
-            .faces
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let own = self.face_colors.iter().rev().find(|c| (c.point - f.origin).length() <= FACE_MATCH);
-                let color = own.map_or(body, |c| c.color);
+        let painted = self.painted_faces(mesh);
+        let faces: Vec<Rgb> = (0..mesh.faces.len())
+            .map(|i| {
+                let color = painted[i].unwrap_or(body);
                 if selected.contains(&i) {
                     [0, 1, 2].map(|k| ((color[k] as u16 + SELECTED_FACE[k] as u16) / 2) as u8)
                 } else {
@@ -2093,7 +2185,7 @@ mod tests {
 
     fn path(points: &[(f64, f64, f64)], closed: bool) -> SketchShape {
         SketchShape::Path {
-            points: points.iter().map(|&(x, y, bulge)| PathPoint { x, y, bulge }).collect(),
+            points: points.iter().map(|&(x, y, bulge)| PathPoint { x, y, bulge, construction: false }).collect(),
             closed,
         }
     }
@@ -2391,8 +2483,8 @@ mod tests {
         let mesh = RenderMesh::from_shape(&body.unwrap());
         let top = mesh.pick(DVec3::new(20.0, 15.0, 100.0), -DVec3::Z).unwrap();
         part.color = Some([255, 0, 0]);
-        part.set_face_color(mesh.faces[top].origin, Some([0, 0, 255]));
-        part.set_face_color(mesh.faces[top].origin, Some([0, 255, 0]));
+        part.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, Some([0, 0, 255]));
+        part.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, Some([0, 255, 0]));
         assert_eq!(part.face_colors.len(), 1, "повторная покраска заменяет прежнюю");
         let colors = part.vertex_colors(&mesh, &[]);
         assert_eq!(colors.len(), mesh.vertices.len() / 7 * 3);
@@ -2402,8 +2494,47 @@ mod tests {
         // Цвета сохраняются в файле; сброс возвращает грани цвет детали.
         let mut saved: Part = serde_json::from_str(&serde_json::to_string(&part).unwrap()).unwrap();
         assert_eq!((saved.color, saved.face_colors[0].color), (Some([255, 0, 0]), [0, 255, 0]));
-        saved.set_face_color(mesh.faces[top].origin, None);
+        saved.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, None);
         assert!(saved.vertex_colors(&mesh, &[]).chunks_exact(3).all(|c| c == [1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn face_color_survives_resize() {
+        let _kernel = kernel();
+        let (mut part, body) = extruded(rect(0.0, 0.0, 40.0, 30.0), 10.0);
+        let mesh = RenderMesh::from_shape(&body.unwrap());
+        let top = mesh.pick(DVec3::new(20.0, 15.0, 100.0), -DVec3::Z).unwrap();
+        part.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, Some([0, 0, 255]));
+        // Деталь стала шире: центр верхней грани уехал, цвет остаётся на ней.
+        let sketch = part.features[0].id;
+        part.sketch_mut(sketch).unwrap().shapes[0] = rect(0.0, 0.0, 70.0, 30.0);
+        let body = part.rebuild(None).unwrap();
+        let mesh = RenderMesh::from_shape(&body);
+        let top = mesh.pick(DVec3::new(35.0, 15.0, 100.0), -DVec3::Z).unwrap();
+        let colors = part.vertex_colors(&mesh, &[]);
+        let v = mesh.vertices.chunks_exact(7).position(|v| v[6] as usize == top).unwrap();
+        assert_eq!(&colors[v * 3..v * 3 + 3], [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn construction_and_axis_lines() {
+        let _kernel = kernel();
+        let (mut part, _) = extruded(rect(0.0, 0.0, 40.0, 30.0), 10.0);
+        let id = part.features[0].id;
+        let sk = part.sketch_mut(id).unwrap();
+        sk.shapes.push(path(&[(0.0, 50.0, 0.0), (30.0, 54.0, 0.0)], false));
+        assert_eq!(sk.nearest_line(DVec2::new(15.0, 52.0), 3.0), Some((1, 0)));
+        sk.make_axis(1, 0, true).unwrap();
+        assert!((sk.shapes[1].points()[1].y - 50.0).abs() < 1e-9);
+        assert!((sk.shapes[1].points()[1].x - (30.0f64 * 30.0 + 16.0).sqrt()).abs() < 1e-9);
+        sk.make_axis(1, 0, false).unwrap();
+        assert!((sk.shapes[1].points()[1].x).abs() < 1e-9);
+        // Линия построения в тело не входит, даже незамкнутая.
+        sk.set_construction(1, 0, true).unwrap();
+        assert!(sk.shapes[1].is_construction());
+        let body = part.rebuild(None);
+        assert!(part.features[1].error.is_none(), "{:?}", part.features[1].error);
+        assert!(body.is_some());
     }
 
     #[test]
@@ -2746,5 +2877,16 @@ mod tests {
         let ghost = part.add("Фаска", FeatureKind::Chamfer { edges: vec![DVec3::new(999.0, 0.0, 0.0)], distance: 1.0 });
         part.rebuild(None);
         assert!(part.feature(ghost).unwrap().error.as_deref().unwrap().contains("не найдено"));
+    }
+}
+
+trait SignumOr {
+    fn signum_or(self, zero: f64) -> f64;
+}
+
+impl SignumOr for f64 {
+    /// Знак числа; для нуля — `zero`.
+    fn signum_or(self, zero: f64) -> f64 {
+        if self.abs() < 1e-12 { zero } else { self.signum() }
     }
 }

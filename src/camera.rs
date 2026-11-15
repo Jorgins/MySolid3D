@@ -29,6 +29,33 @@ impl Default for Camera {
     }
 }
 
+/// Снимок камеры для быстрой проекции точек на экран.
+#[derive(Clone, Copy)]
+pub struct Projector {
+    target: DVec3,
+    right: DVec3,
+    up: DVec3,
+    eye: DVec3,
+    scale: f64,
+    center: Pos2,
+    dist: Option<f64>,
+}
+
+impl Projector {
+    pub fn project(&self, p: DVec3) -> Pos2 {
+        let d = p - self.target;
+        // В перспективе всё, что дальше цели, мельче, а ближе — крупнее.
+        let k = match self.dist {
+            Some(dist) => dist / (dist - d.dot(self.eye)).max(dist * 1e-3),
+            None => 1.0,
+        };
+        Pos2::new(
+            self.center.x + (d.dot(self.right) * self.scale * k) as f32,
+            self.center.y - (d.dot(self.up) * self.scale * k) as f32,
+        )
+    }
+}
+
 impl Camera {
     /// Направление от цели к наблюдателю.
     fn eye_dir(&self) -> DVec3 {
@@ -81,17 +108,36 @@ impl Camera {
     }
 
     pub fn project(&self, rect: Rect, p: DVec3) -> Pos2 {
-        let d = p - self.target;
-        let c = rect.center();
-        // В перспективе всё, что дальше цели, мельче, а ближе — крупнее.
-        let k = match self.eye_distance(rect) {
-            Some(dist) => dist / (dist - d.dot(self.eye_dir())).max(dist * 1e-3),
-            None => 1.0,
-        };
-        Pos2::new(
-            c.x + (d.dot(self.right()) * self.scale * k) as f32,
-            c.y - (d.dot(self.up()) * self.scale * k) as f32,
-        )
+        self.projector(rect).project(p)
+    }
+
+    /// Обрезает отрезок по плоскости перед камерой: в перспективе то, что позади глаза, не рисуется.
+    /// В параллельной проекции отрезок не меняется.
+    pub fn clip_to_view(&self, rect: Rect, a: DVec3, b: DVec3) -> Option<(DVec3, DVec3)> {
+        let Some(dist) = self.eye_distance(rect) else { return Some((a, b)) };
+        // Глубина точки к глазу: чем больше, тем ближе к камере; на 0,95·dist лежит сам глаз с небольшим запасом.
+        let limit = dist * 0.95;
+        let e = self.eye_dir();
+        let (sa, sb) = ((a - self.target).dot(e), (b - self.target).dot(e));
+        match (sa <= limit, sb <= limit) {
+            (true, true) => Some((a, b)),
+            (false, false) => None,
+            (true, false) => Some((a, a + (b - a) * ((limit - sa) / (sb - sa)))),
+            (false, true) => Some((a + (b - a) * ((limit - sa) / (sb - sa)), b)),
+        }
+    }
+
+    /// Проекция с заранее посчитанными осями камеры — для циклов по тысячам точек.
+    pub fn projector(&self, rect: Rect) -> Projector {
+        Projector {
+            target: self.target,
+            right: self.right(),
+            up: self.up(),
+            eye: self.eye_dir(),
+            scale: self.scale,
+            center: rect.center(),
+            dist: self.eye_distance(rect),
+        }
     }
 
     /// Луч из точки экрана: (начало далеко перед сценой, направление взгляда).
