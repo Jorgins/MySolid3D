@@ -2,7 +2,7 @@
 
 use crate::camera::Camera;
 use crate::model::{
-    bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Material, Part, PathPoint, Plane,
+    bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Material, Part, PathPoint, Pick, Plane, Relation,
     RenderMesh, Sketch, SketchImage, SketchShape, TreeItem, MIN_SIZE,
 };
 use crate::render::{DrawParams, RenderMode, Renderer};
@@ -96,12 +96,8 @@ fn regions_ui(
 }
 
 /// Элемент `r` ещё существует в эскизе (фигуру или точку могли удалить).
-fn sketch_ref_exists(sketch: &Sketch, r: DimRef) -> bool {
-    match r {
-        DimRef::Origin => true,
-        DimRef::Point(s, i) => sketch.shapes.get(s).is_some_and(|s| i < s.points().len()),
-        _ => false,
-    }
+fn sketch_ref_exists(sketch: &Sketch, r: Pick) -> bool {
+    sketch.pick_pos(r).is_some()
 }
 
 /// Что делает мышь с картинкой-подложкой.
@@ -151,7 +147,7 @@ struct SketchEdit {
     multi: Vec<usize>,
     group_drag: Option<GroupDrag>,
     /// Точки (и начало координат), выбранные стрелкой для связи: до двух.
-    points_sel: Vec<DimRef>,
+    points_sel: Vec<Pick>,
     /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
     line_menu: Option<(usize, usize)>,
     /// Открытое окно операции над выбранной фигурой и введённые в нём параметры.
@@ -2814,10 +2810,7 @@ impl App {
                 }
                 // Щелчок по точке контура или по началу координат отмечает её для связи (до двух точек).
                 if clicked && !dragging_vertex {
-                    let hit = pointer
-                        .and_then(raw_at)
-                        .and_then(|p| sketch.pick_ref(p, 8.0 * px))
-                        .filter(|r| matches!(r, DimRef::Point(..) | DimRef::Origin));
+                    let hit = pointer.and_then(raw_at).and_then(|p| sketch.pick_point(p, 8.0 * px));
                     match hit {
                         Some(r) if edit.points_sel.contains(&r) => edit.points_sel.retain(|x| *x != r),
                         Some(r) => {
@@ -3045,13 +3038,22 @@ impl App {
         }
         // Точки, выбранные стрелкой: кольца и панель со связями между ними.
         edit.points_sel.retain(|r| sketch_ref_exists(sketch, *r));
+        // В режиме выбора середины сегментов отмечены ромбиками: их тоже можно выбрать для связи.
+        if edit.tool == Tool::Select {
+            for (si, shape) in sketch.shapes.iter().enumerate() {
+                for k in (0..).take_while(|&k| shape.segment(k).is_some()) {
+                    let Some(q) = sketch.pick_pos(Pick::Mid(si, k)) else { continue };
+                    let c = cam.project(rect, plane.to_world(q));
+                    if rect.contains(c) && !edit.points_sel.contains(&Pick::Mid(si, k)) {
+                        let r = 3.5;
+                        let diamond = vec![c + Vec2::new(0.0, -r), c + Vec2::new(r, 0.0), c + Vec2::new(0.0, r), c + Vec2::new(-r, 0.0)];
+                        painter.add(egui::Shape::closed_line(diamond, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 150))));
+                    }
+                }
+            }
+        }
         for r in &edit.points_sel {
-            let q = match r {
-                DimRef::Origin => Some(DVec2::ZERO),
-                DimRef::Point(si, pi) => sketch.shapes.get(*si).and_then(|s| s.points().get(*pi).copied()),
-                _ => None,
-            };
-            if let Some(q) = q {
+            if let Some(q) = sketch.pick_pos(*r) {
                 painter.circle_stroke(cam.project(rect, plane.to_world(q)), 8.0, Stroke::new(2.0, SELECT_COLOR));
             }
         }
@@ -3059,7 +3061,7 @@ impl App {
         if edit.tool == Tool::Select && !edit.points_sel.is_empty() {
             // Начало координат неподвижно, поэтому оно всегда «первое»: к нему подтягивается вторая точка.
             let mut pair = edit.points_sel.clone();
-            if pair.len() == 2 && pair[1] == DimRef::Origin {
+            if pair.len() == 2 && pair[1] == Pick::Ref(DimRef::Origin) {
                 pair.swap(0, 1);
             }
             egui::Area::new(egui::Id::unique("point_relations"))
@@ -3068,13 +3070,13 @@ impl App {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             if let [a, b] = pair[..] {
-                                for r in sketch.relations(a, b) {
+                                for r in [Relation::Coincident, Relation::Horizontal, Relation::Vertical] {
                                     if ui.button(r.name()).clicked() {
                                         point_relation = Some((a, b, r));
                                     }
                                 }
                             } else {
-                                ui.weak("Выберите вторую точку (или начало координат) для связи");
+                                ui.weak("Выберите вторую точку, середину отрезка или начало координат");
                             }
                             if ui.small_button("✕").on_hover_text("Снять выбор точек").clicked() {
                                 edit.points_sel.clear();
@@ -3084,7 +3086,7 @@ impl App {
                 });
         }
         if let Some((a, b, r)) = point_relation {
-            if let Err(e) = sketch.apply_relation(a, b, r) {
+            if let Err(e) = sketch.align(a, b, r) {
                 self.status = e;
             }
             edit.points_sel.clear();

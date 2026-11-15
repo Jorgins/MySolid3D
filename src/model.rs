@@ -702,6 +702,14 @@ pub enum DimRef {
     Circle(usize),
 }
 
+/// Точка, которую стрелкой выбирают для связи: обычная точка (или начало координат) либо середина сегмента.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick {
+    Ref(DimRef),
+    /// Середина сегмента: (фигура, номер сегмента).
+    Mid(usize, usize),
+}
+
 /// Как измеряется расстояние между двумя точками.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DimMode {
@@ -1006,6 +1014,65 @@ impl Sketch {
         let j = (seg + 1) % n;
         (points[j].x, points[j].y) = (end.x, end.y);
         Ok(())
+    }
+
+    /// Положение выбранной точки.
+    pub fn pick_pos(&self, pick: Pick) -> Option<DVec2> {
+        match pick {
+            Pick::Ref(r) => match self.ref_geom(r)? {
+                RefGeom::Point(q) => Some(q),
+                RefGeom::Line(..) => None,
+            },
+            Pick::Mid(s, i) => {
+                let (a, b, bulge) = self.shapes.get(s)?.segment(i)?;
+                Some(if bulge == 0.0 { (a + b) * 0.5 } else { arc_mid(a, b, bulge) })
+            }
+        }
+    }
+
+    /// Выбираемая точка рядом с `p`: сначала точки контура и начало координат, потом середины сегментов.
+    pub fn pick_point(&self, p: DVec2, tol: f64) -> Option<Pick> {
+        if let Some(r @ (DimRef::Point(..) | DimRef::Origin)) = self.pick_ref(p, tol) {
+            return Some(Pick::Ref(r));
+        }
+        let mut best: Option<(f64, Pick)> = None;
+        for (s, shape) in self.shapes.iter().enumerate() {
+            let mut i = 0;
+            while shape.segment(i).is_some() {
+                let pick = Pick::Mid(s, i);
+                if let Some(q) = self.pick_pos(pick) {
+                    let d = (q - p).length();
+                    if d < tol && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, pick));
+                    }
+                }
+                i += 1;
+            }
+        }
+        best.map(|(_, pick)| pick)
+    }
+
+    /// Совмещает две выбранные точки или ставит их на одну горизонталь или вертикаль.
+    /// Первая остаётся на месте, вторая (вместе с отрезком или фигурой) сдвигается.
+    pub fn align(&mut self, a: Pick, b: Pick, relation: Relation) -> Result<(), String> {
+        let (Some(pa), Some(pb)) = (self.pick_pos(a), self.pick_pos(b)) else { return Err(DIM_GONE.into()) };
+        let d = match relation {
+            Relation::Coincident => pa - pb,
+            Relation::Horizontal => DVec2::new(0.0, pa.y - pb.y),
+            Relation::Vertical => DVec2::new(pa.x - pb.x, 0.0),
+            _ => return Err("для точек есть совпадение, горизонталь и вертикаль".into()),
+        };
+        if d.length() < 1e-12 {
+            return Ok(());
+        }
+        let as_ref = |p: Pick| match p {
+            Pick::Ref(r) => r,
+            Pick::Mid(s, i) => DimRef::Segment(s, i),
+        };
+        if b == Pick::Ref(DimRef::Origin) {
+            return Err("начало координат неподвижно — выберите его первой точкой".into());
+        }
+        self.move_ref(as_ref(b), as_ref(a), d)
     }
 
     /// Элемент эскиза рядом с точкой `p`; точки важнее линий.
@@ -2797,6 +2864,31 @@ mod tests {
             s.toggle_region(boss, 1);
         }
         let _ = part.rebuild(None);
+    }
+
+    #[test]
+    fn align_segment_midpoints() {
+        let mut s = Sketch::new(
+            Plane::TOP,
+            vec![path(&[(0.0, 0.0, 0.0), (20.0, 0.0, 0.0)], false), path(&[(5.0, 10.0, 0.0), (15.0, 18.0, 0.0)], false)],
+        );
+        let (mid_a, mid_b) = (Pick::Mid(0, 0), Pick::Mid(1, 0));
+        assert_eq!(s.pick_pos(mid_a), Some(DVec2::new(10.0, 0.0)));
+        // Середина первой на 10 по X: вторая фигура сдвигается так, чтобы её начало встало на X = 10.
+        s.align(mid_a, Pick::Ref(DimRef::Point(1, 0)), Relation::Vertical).unwrap();
+        assert!((s.shapes[1].points()[0].x - 10.0).abs() < 1e-9);
+        // Середина второй встаёт на горизонталь середины первой.
+        s.align(mid_a, mid_b, Relation::Horizontal).unwrap();
+        assert!(s.pick_pos(mid_b).unwrap().y.abs() < 1e-9);
+        // Совпадение середин; начало координат — только первой точкой.
+        s.align(mid_a, mid_b, Relation::Coincident).unwrap();
+        assert!((s.pick_pos(mid_b).unwrap() - DVec2::new(10.0, 0.0)).length() < 1e-9);
+        assert!(s.align(mid_a, Pick::Ref(DimRef::Origin), Relation::Coincident).is_err());
+        s.align(Pick::Ref(DimRef::Origin), mid_b, Relation::Vertical).unwrap();
+        assert!(s.pick_pos(mid_b).unwrap().x.abs() < 1e-9);
+        // Рядом с серединой отрезка она находится щелчком, а вершины важнее.
+        assert_eq!(s.pick_point(DVec2::new(0.1, 0.1), 1.0), Some(Pick::Ref(DimRef::Point(0, 0))));
+        assert!(matches!(s.pick_point(s.pick_pos(mid_a).unwrap() + DVec2::new(0.2, 0.0), 1.0), Some(Pick::Mid(0, 0))));
     }
 
     #[test]
