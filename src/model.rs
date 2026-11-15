@@ -557,6 +557,9 @@ pub struct Sketch {
     /// Картинка-подложка, по которой удобно обводить контуры.
     #[serde(default)]
     pub image: Option<SketchImage>,
+    /// Где стоит размерная линия (подпись) у поставленных размеров, как их разместил пользователь.
+    #[serde(default)]
+    pub dim_places: Vec<(Dim, DVec2)>,
 }
 
 /// Картинка-подложка эскиза. В файле детали хранится только путь к ней.
@@ -737,7 +740,7 @@ fn shift_chain(
 
 impl Sketch {
     pub fn new(plane: Plane, shapes: Vec<SketchShape>) -> Self {
-        Self { plane, shapes, dims: Vec::new(), image: None }
+        Self { plane, shapes, dims: Vec::new(), image: None, dim_places: Vec::new() }
     }
 
     /// Удаляет фигуру вместе с её размерами; размеры остальных фигур остаются на своих местах.
@@ -1083,6 +1086,30 @@ impl Sketch {
             Dim::Distance(a, b, mode) => self.distance_axis(a, b, mode).map(|(v, _)| v.abs()),
             Dim::Angle(a, b) => self.line_angle(a, b).map(|v| v.abs().to_degrees()),
         }
+    }
+
+    /// Место размерной линии размера `dim`, если пользователь его выбрал.
+    pub fn dim_place(&self, dim: &Dim) -> Option<DVec2> {
+        self.dim_places.iter().find(|(d, _)| d == dim).map(|(_, p)| *p)
+    }
+
+    pub fn set_dim_place(&mut self, dim: Dim, place: DVec2) {
+        self.dim_places.retain(|(d, _)| *d != dim);
+        self.dim_places.push((dim, place));
+    }
+
+    /// Размер изменил способ измерения — его место переходит к новому виду размера.
+    pub fn rekey_dim_place(&mut self, old: Dim, new: Dim) {
+        if let Some(place) = self.dim_place(&old) {
+            self.dim_places.retain(|(d, _)| *d != old);
+            self.set_dim_place(new, place);
+        }
+    }
+
+    /// Забывает места размеров, которых в эскизе уже нет.
+    pub fn prune_dim_places(&mut self) {
+        let dims = &self.dims;
+        self.dim_places.retain(|(d, _)| dims.contains(d));
     }
 
     /// Отрезок, вдоль которого измеряется расстояние, — для показа на экране.
@@ -2327,6 +2354,12 @@ mod tests {
         s.store_dim(Dim::Size(DimRef::Circle(1)));
         assert_eq!(s.round_corners(0, None, 1.0, true), Ok(4));
         assert_eq!(s.dims, [Dim::Size(DimRef::Circle(1))]);
+        // Место размера хранится вместе с эскизом и забывается вместе с размером.
+        s.set_dim_place(Dim::Size(DimRef::Circle(1)), DVec2::new(3.0, 4.0));
+        s.set_dim_place(Dim::Size(DimRef::Circle(0)), DVec2::ONE);
+        s.prune_dim_places();
+        let saved: Sketch = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(saved.dim_places, [(Dim::Size(DimRef::Circle(1)), DVec2::new(3.0, 4.0))]);
         assert!(SketchShape::Circle { cx: 0.0, cy: 0.0, r: 1.0 }.round_corners(None, 1.0, false).is_err());
     }
 

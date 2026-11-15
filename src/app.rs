@@ -122,6 +122,8 @@ struct DimEdit {
     text: String,
     pos: Pos2,
     focus: bool,
+    /// Куда пользователь поставил размерную линию (в координатах эскиза).
+    place: Option<DVec2>,
 }
 
 /// Все иконки действий (файлы `assets/icons/<имя>.png`, готовятся `tools/make_icons.py`).
@@ -2408,9 +2410,10 @@ impl App {
                 }
             }
         }
+        sketch.prune_dim_places();
         let mut labels = Vec::new();
         for (i, dim) in sketch.dims.iter().enumerate() {
-            draw_dim(painter, &cam, rect, &plane, sketch, dim, i, &mut labels);
+            draw_dim(painter, &cam, rect, &plane, sketch, dim, sketch.dim_place(dim), i, &mut labels);
         }
         // Пока фигура рисуется, её величина показывается рядом с курсором (это не размер).
         let mut readout = None;
@@ -2452,38 +2455,56 @@ impl App {
                 edit.dim_first = None;
             }
         }
-        // Расстояние между двумя элементами: способ измерения следует за курсором, щелчок ставит размер.
-        if let Some(Dim::Distance(a, b, _)) = edit.placing {
-            let span = sketch.dim_span(&Dim::Distance(a, b, DimMode::Aligned));
-            if let (Some(p), Some((from, to))) = (pointer.and_then(raw_at), span) {
-                let dim = Dim::Distance(a, b, placing_mode(from, to, p));
-                edit.placing = Some(dim);
-                if resp.clicked() && request.is_none() {
+        // Размер ставится как в SolidWorks: выбрали элемент (или два), ведёте курсор — размерная линия
+        // (а у расстояния и способ измерения) следует за ним, щелчок фиксирует место и открывает ввод значения.
+        let mut req_place: Option<DVec2> = None;
+        if let Some(mut dim) = edit.placing {
+            let cursor = pointer.and_then(raw_at);
+            if let (Dim::Distance(a, b, _), Some(p)) = (dim, cursor) {
+                if sketch.dim_has_modes(&dim) {
+                    if let Some((from, to)) = sketch.dim_span(&Dim::Distance(a, b, DimMode::Aligned)) {
+                        dim = Dim::Distance(a, b, placing_mode(from, to, p));
+                        edit.placing = Some(dim);
+                    }
+                }
+            }
+            if resp.clicked() && request.is_none() {
+                // Щелчок по другому элементу, с которым возможен размер, начинает размер между двумя.
+                let hit = cursor.and_then(|p| sketch.pick_ref(p, 8.0 * px));
+                let pairs = edit.dim_first.zip(hit).is_some_and(|(f, h)| f != h && sketch.pair_dim(f, h).is_some());
+                if !pairs {
                     let pos = pointer.unwrap_or(rect.center()) + Vec2::new(14.0, 14.0);
                     request = Some((dim, None, pos));
+                    req_place = cursor;
                     edit.placing = None;
+                    edit.dim_first = None;
                 }
             }
         }
-        // Инструмент «Размер»: щелчок по элементу или по двум элементам предлагает размер.
-        if dim_tool && resp.clicked() && request.is_none() && edit.placing.is_none() {
+        // Инструмент «Размер»: щелчок по элементу — его размер, по второму элементу — размер между двумя.
+        if dim_tool && resp.clicked() && request.is_none() {
             let hit = pointer.and_then(raw_at).and_then(|p| sketch.pick_ref(p, 8.0 * px));
-            let pos = pointer.unwrap_or(rect.center()) + Vec2::new(14.0, 14.0);
-            let pair = edit.dim_first.zip(hit).and_then(|(a, b)| sketch.pair_dim(a, b));
+            let pair = edit.dim_first.zip(hit).filter(|(a, b)| a != b).and_then(|(a, b)| sketch.pair_dim(a, b));
             edit.dim_first = None;
+            edit.placing = None;
             self.dim_edit = None;
             self.status.clear();
             match (pair, hit) {
-                // Второй элемент — размер между двумя.
-                (Some(dim), _) if matches!(dim, Dim::Distance(..)) && sketch.dim_has_modes(&dim) => {
+                (Some(dim), _) => {
                     edit.placing = Some(dim);
-                    self.status = "Ведите курсор: по горизонтали, по вертикали или вдоль линии между точками — щелчок ставит размер".into();
+                    self.status = if sketch.dim_has_modes(&dim) {
+                        "Ведите курсор: по горизонтали, по вертикали или вдоль линии между точками — щелчок ставит размер".into()
+                    } else {
+                        "Щёлкните там, где должна стоять размерная линия".into()
+                    };
                 }
-                (Some(dim), _) => request = Some((dim, None, pos)),
                 (None, Some(r)) => {
                     edit.dim_first = Some(r);
                     match sketch.element_dim(r) {
-                        Some(dim) => request = Some((dim, None, pos)),
+                        Some(dim) => {
+                            edit.placing = Some(dim);
+                            self.status = "Щёлкните там, где поставить размер, или укажите второй элемент".into();
+                        }
                         None => self.status = "Укажите второй элемент — точку или отрезок".into(),
                     }
                 }
@@ -2491,7 +2512,7 @@ impl App {
             }
         }
         if let Some((dim, stored, pos)) = request {
-            self.dim_edit = Some(DimEdit { dim, stored, text: String::new(), pos, focus: true });
+            self.dim_edit = Some(DimEdit { dim, stored, text: String::new(), pos, focus: true, place: req_place });
         }
 
         // Подсветка элементов, к которым относится размер.
@@ -2511,20 +2532,16 @@ impl App {
             if let Some(r) = edit.dim_first {
                 mark(r, Stroke::new(3.0, SELECT_COLOR));
             }
-            if let Some(dim @ Dim::Distance(a, b, mode)) = edit.placing {
-                mark(a, Stroke::new(3.0, SELECT_COLOR));
-                mark(b, Stroke::new(3.0, SELECT_COLOR));
-                if let Some((from, to)) = sketch.dim_span(&dim) {
-                    painter.line_segment([to_screen(from), to_screen(to)], Stroke::new(1.5, SELECT_COLOR));
+            if let Some(dim) = edit.placing {
+                match dim {
+                    Dim::Size(r) => mark(r, Stroke::new(3.0, SELECT_COLOR)),
+                    Dim::Distance(a, b, _) | Dim::Angle(a, b) => {
+                        mark(a, Stroke::new(3.0, SELECT_COLOR));
+                        mark(b, Stroke::new(3.0, SELECT_COLOR));
+                    }
                 }
-                if let (Some(p), Some(v)) = (pointer, sketch.dim_value(&dim)) {
-                    let name = match mode {
-                        DimMode::Horizontal => "по горизонтали",
-                        DimMode::Vertical => "по вертикали",
-                        DimMode::Aligned => "вдоль линии",
-                    };
-                    let text = format!("{} мм · {name}", fmt_mm(v));
-                    painter.text(p + Vec2::new(16.0, 16.0), Align2::LEFT_TOP, text, FontId::proportional(13.0), SELECT_COLOR);
+                if let Some(p) = pointer.and_then(raw_at) {
+                    draw_dim(painter, &cam, rect, &plane, sketch, &dim, Some(p), usize::MAX, &mut Vec::new());
                 }
             }
         }
@@ -2537,8 +2554,9 @@ impl App {
                     mark(b, stroke);
                 }
             }
-            if let Some((from, to)) = sketch.dim_span(&de.dim) {
-                painter.line_segment([to_screen(from), to_screen(to)], Stroke::new(1.5, SELECT_COLOR));
+            // Размер ещё не поставлен — показываем его там, где его разместили.
+            if de.stored.is_none() {
+                draw_dim(painter, &cam, rect, &plane, sketch, &de.dim, de.place, usize::MAX, &mut Vec::new());
             }
         }
     }
@@ -2623,6 +2641,7 @@ impl App {
             de.focus = !close;
         }
         let dim = de.dim;
+        let place = de.place;
         let text = de.text.trim().replace(',', ".");
         let sketch = self.sketch.as_ref().and_then(|e| self.part.sketch_mut(e.id));
         let mut result = None;
@@ -2636,8 +2655,16 @@ impl App {
             } else if apply {
                 // Enter ставит размер в эскиз (или обновляет способ измерения у поставленного).
                 match stored {
-                    Some(i) => sketch.dims[i] = dim,
-                    None => drop(sketch.store_dim(dim)),
+                    Some(i) => {
+                        let old = std::mem::replace(&mut sketch.dims[i], dim);
+                        sketch.rekey_dim_place(old, dim);
+                    }
+                    None => {
+                        let _ = sketch.store_dim(dim);
+                        if let Some(place) = place {
+                            sketch.set_dim_place(dim, place);
+                        }
+                    }
                 }
                 if !text.is_empty() {
                     result = Some(match text.parse::<f64>() {
@@ -2724,7 +2751,19 @@ fn shapes_ui(ui: &mut egui::Ui, sketch: &mut Sketch, selected: Option<usize>) ->
     (changed, remove.is_some())
 }
 
-/// Рисует поставленный размер и запоминает область его подписи.
+/// Стрелка с остриём в `tip`; `dir` — единичное направление движения к острию.
+fn arrow(painter: &Painter, tip: Pos2, dir: Vec2, color: Color32) {
+    let back = tip - dir * 9.0;
+    let side = Vec2::new(-dir.y, dir.x) * 3.2;
+    painter.add(egui::Shape::convex_polygon(vec![tip, back + side, back - side], color, Stroke::NONE));
+}
+
+fn unit(v: Vec2, fallback: Vec2) -> Vec2 {
+    if v.length() > 1e-3 { v.normalized() } else { fallback }
+}
+
+/// Рисует размер, как в SolidWorks: выносные линии, размерная линия со стрелками там, куда её поставил
+/// пользователь (`place`), выноска для радиуса и диаметра, дуга для угла. Запоминает область подписи.
 #[allow(clippy::too_many_arguments)]
 fn draw_dim(
     painter: &Painter,
@@ -2733,50 +2772,143 @@ fn draw_dim(
     plane: &Plane,
     sketch: &Sketch,
     dim: &Dim,
+    place: Option<DVec2>,
     index: usize,
     labels: &mut Vec<DimLabel>,
 ) {
     let Some(value) = sketch.dim_value(dim) else { return };
     let to_screen = |p: DVec2| cam.project(rect, plane.to_world(p));
-    let outline = |r: DimRef| -> Vec<Pos2> { sketch.ref_outline(r).into_iter().map(to_screen).collect() };
-    let stroke = Stroke::new(1.0, Color32::from_gray(170));
-    let away = |from: Pos2, to: Pos2| {
-        let d = to - from;
-        if d.length() > 0.5 { d.normalized() } else { Vec2::new(0.0, -1.0) }
+    let px = 1.0 / cam.scale;
+    let color = Color32::from_gray(200);
+    let stroke = Stroke::new(1.0, color);
+    let anchor = |r: DimRef| -> Option<DVec2> {
+        let o = sketch.ref_outline(r);
+        match o.len() {
+            0 => None,
+            1 => Some(o[0]),
+            2 => Some((o[0] + o[1]) * 0.5),
+            n => Some(o[n / 2]),
+        }
     };
+    // Линейный размер: выносные линии от `a` и `b` к размерной линии, идущей вдоль `dir` через `at`.
+    let linear = |a: DVec2, b: DVec2, dir: DVec2, at: DVec2| -> Pos2 {
+        let perp = DVec2::new(-dir.y, dir.x);
+        let p1 = a + perp * (at - a).dot(perp);
+        let p2 = b + perp * (at - b).dot(perp);
+        let (sa, sb, s1, s2) = (to_screen(a), to_screen(b), to_screen(p1), to_screen(p2));
+        for (from, to) in [(sa, s1), (sb, s2)] {
+            let d = to - from;
+            if d.length() > 1.0 {
+                let u = d.normalized();
+                painter.line_segment([from + u * 3.0, to + u * 4.0], stroke);
+            }
+        }
+        let l = s2 - s1;
+        let u = unit(l, Vec2::X);
+        if l.length() >= 26.0 {
+            painter.line_segment([s1, s2], stroke);
+            arrow(painter, s1, -u, color);
+            arrow(painter, s2, u, color);
+        } else {
+            // Места мало — стрелки снаружи, направленные внутрь.
+            painter.line_segment([s1 - u * 16.0, s1], stroke);
+            painter.line_segment([s2, s2 + u * 16.0], stroke);
+            arrow(painter, s1, u, color);
+            arrow(painter, s2, -u, color);
+        }
+        s1 + l * 0.5
+    };
+    let side = |dir: DVec2| DVec2::new(-dir.y, dir.x) * 20.0 * px;
     let (pos, text) = match *dim {
-        Dim::Distance(..) => {
-            let Some((from, to)) = sketch.dim_span(dim) else { return };
-            let (a, b) = (to_screen(from), to_screen(to));
-            // Размерная линия идёт сбоку от измеряемого промежутка, к ней — выносные линии.
-            let side = away(a, b);
-            let off = Vec2::new(side.y, -side.x) * 20.0;
-            painter.line_segment([a, a + off * 1.25], stroke);
-            painter.line_segment([b, b + off * 1.25], stroke);
-            painter.line_segment([a + off, b + off], stroke);
-            (a + (b - a) * 0.5 + off, fmt_mm(value))
+        Dim::Distance(a, b, mode) => {
+            let (Some(pa), Some(pb)) = (anchor(a), anchor(b)) else { return };
+            let fallback = if mode == DimMode::Vertical { DVec2::Y } else { DVec2::X };
+            let dir = sketch
+                .dim_span(dim)
+                .map(|(from, to)| to - from)
+                .filter(|d| d.length() > 1e-9)
+                .map_or(fallback, |d| d.normalize());
+            let at = place.unwrap_or_else(|| (pa + pb) * 0.5 + side(dir));
+            (linear(pa, pb, dir, at), fmt_mm(value))
         }
         Dim::Angle(a, b) => {
-            let pts: Vec<Pos2> = outline(a).into_iter().chain(outline(b)).collect();
-            if pts.is_empty() {
-                return;
-            }
-            let sum = pts.iter().fold(Vec2::ZERO, |acc, p| acc + p.to_vec2());
-            ((sum / pts.len() as f32).to_pos2(), format!("{}°", fmt_mm(value)))
+            let (oa, ob) = (sketch.ref_outline(a), sketch.ref_outline(b));
+            let ends = |o: &[DVec2]| (o.len() >= 2).then(|| (o[0], o[o.len() - 1]));
+            // Дуга между двумя прямыми с центром в их пересечении.
+            let arc = (|| -> Option<Pos2> {
+                let ((a0, a1), (b0, b1)) = (ends(&oa)?, ends(&ob)?);
+                let (d1, d2) = (a1 - a0, b1 - b0);
+                let cross = d1.perp_dot(d2);
+                if cross.abs() < 1e-9 {
+                    return None;
+                }
+                let v = a0 + d1 * ((b0 - a0).perp_dot(d2) / cross);
+                let (da, db) = (d1.normalize(), d2.normalize());
+                let bisector = ((a0 + a1) * 0.5 - v).normalize_or_zero() + ((b0 + b1) * 0.5 - v).normalize_or_zero();
+                let guess = if bisector.length() > 1e-9 { bisector.normalize() } else { da };
+                let u = place.map(|p| p - v).filter(|d| d.length() > 1e-9).map_or(guess, |d| d.normalize());
+                let wanted = value.to_radians();
+                let pairs: Vec<(DVec2, DVec2)> = [(da, db), (-da, -db), (da, -db), (-da, db)]
+                    .into_iter()
+                    .filter(|(s1, s2)| (s1.dot(*s2).clamp(-1.0, 1.0).acos() - wanted).abs() < 0.01)
+                    .collect();
+                let inside = |&&(s1, s2): &&(DVec2, DVec2)| {
+                    let c = s1.perp_dot(s2);
+                    s1.perp_dot(u) * c > 0.0 && u.perp_dot(s2) * c > 0.0
+                };
+                let (s1, s2) = *pairs.iter().find(inside).or(pairs.first())?;
+                let radius = place.map_or(40.0 * px, |p| (p - v).length()).max(12.0 * px);
+                let delta = s1.perp_dot(s2).atan2(s1.dot(s2));
+                let pts: Vec<Pos2> = (0..=24)
+                    .map(|k| {
+                        let (sin, cos) = (delta * k as f64 / 24.0).sin_cos();
+                        let dir = DVec2::new(s1.x * cos - s1.y * sin, s1.x * sin + s1.y * cos);
+                        to_screen(v + dir * radius)
+                    })
+                    .collect();
+                painter.line(pts.clone(), stroke);
+                arrow(painter, pts[0], unit(pts[0] - pts[1], Vec2::X), color);
+                arrow(painter, pts[24], unit(pts[24] - pts[23], Vec2::X), color);
+                Some(pts[12])
+            })();
+            let pos = arc.unwrap_or_else(|| {
+                let pts: Vec<Pos2> = oa.iter().chain(&ob).map(|p| to_screen(*p)).collect();
+                let sum = pts.iter().fold(Vec2::ZERO, |acc, p| acc + p.to_vec2());
+                let center = (sum / pts.len().max(1) as f32).to_pos2();
+                match place.map(to_screen) {
+                    Some(at) => {
+                        painter.line_segment([center, at], stroke);
+                        at
+                    }
+                    None => center,
+                }
+            });
+            (pos, format!("{}°", fmt_mm(value)))
         }
         Dim::Size(r) => {
-            let pts = outline(r);
-            let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied()) else { return };
-            if let DimRef::Circle(_) = r {
-                // Выноска под 45° от окружности.
-                let (p, opposite) = (pts[pts.len() / 8], pts[pts.len() / 8 + pts.len() / 2]);
-                let end = p + away(opposite, p) * 28.0;
-                painter.line_segment([p, end], stroke);
-                (end, format!("Ø{}", fmt_mm(value)))
+            let o = sketch.ref_outline(r);
+            if o.len() == 2 {
+                let (a, b) = (o[0], o[1]);
+                let dir = if (b - a).length() > 1e-9 { (b - a).normalize() } else { DVec2::X };
+                let at = place.unwrap_or_else(|| (a + b) * 0.5 + side(dir));
+                (linear(a, b, dir, at), fmt_mm(value))
+            } else if o.len() > 2 {
+                // Радиус и диаметр: выноска со стрелкой на ближайшую к курсору точку дуги.
+                let centroid = o.iter().fold(DVec2::ZERO, |sum, p| sum + *p) / o.len() as f64;
+                let is_circle = matches!(r, DimRef::Circle(_));
+                let tip = match place {
+                    Some(at) => *o.iter().min_by(|x, y| (**x - at).length().total_cmp(&(**y - at).length())).unwrap(),
+                    None => o[if is_circle { o.len() / 8 } else { o.len() / 2 }],
+                };
+                let outward = (tip - centroid).try_normalize().unwrap_or(DVec2::X);
+                let at = place.unwrap_or(tip + outward * 28.0 * px);
+                let (st, sa) = (to_screen(tip), to_screen(at));
+                painter.line_segment([st, sa], stroke);
+                arrow(painter, st, unit(st - sa, Vec2::X), color);
+                let prefix = if is_circle { "Ø" } else { "R" };
+                (sa, format!("{prefix}{}", fmt_mm(value)))
             } else {
-                let mid = pts[pts.len() / 2];
-                let chord_mid = first + (last - first) * 0.5;
-                (mid + away(chord_mid, mid) * 16.0, format!("R{}", fmt_mm(value)))
+                return;
             }
         }
     };
