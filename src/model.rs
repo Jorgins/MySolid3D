@@ -197,6 +197,35 @@ impl SketchShape {
         }
     }
 
+    /// Растягивает фигуру от неподвижной точки `anchor`: по X в `sx` раз, по Y в `sy` раз (знак — отражение).
+    pub fn stretch(&mut self, anchor: DVec2, sx: f64, sy: f64) {
+        let map = |p: DVec2| anchor + (p - anchor) * DVec2::new(sx, sy);
+        match self {
+            SketchShape::Rect { x, y, w, h } => {
+                let (a, b) = (map(DVec2::new(*x, *y)), map(DVec2::new(*x + *w, *y + *h)));
+                *x = a.x.min(b.x);
+                *y = a.y.min(b.y);
+                *w = (b.x - a.x).abs();
+                *h = (b.y - a.y).abs();
+            }
+            SketchShape::Circle { cx, cy, r } => {
+                let c = map(DVec2::new(*cx, *cy));
+                (*cx, *cy) = (c.x, c.y);
+                *r *= (sx.abs() + sy.abs()) / 2.0;
+            }
+            SketchShape::Path { points, .. } => {
+                for p in points.iter_mut() {
+                    let q = map(p.pos());
+                    (p.x, p.y) = (q.x, q.y);
+                    // Отражение по одной оси разворачивает и дугу.
+                    if sx * sy < 0.0 {
+                        p.bulge = -p.bulge;
+                    }
+                }
+            }
+        }
+    }
+
     /// Сегмент `i` — линия построения.
     pub fn segment_construction(&self, i: usize) -> bool {
         matches!(self, SketchShape::Path { points, .. } if points.get(i).is_some_and(|p| p.construction))
@@ -3037,6 +3066,22 @@ mod tests {
         let before = t.shapes[0].clone();
         assert!(t.round_corner_set(0, &[0, 1], 3.0, false).is_err());
         assert_eq!(t.shapes[0], before);
+    }
+
+    #[test]
+    fn stretch_from_anchor() {
+        let mut r = rect(10.0, 10.0, 40.0, 30.0);
+        // Якорь — левый нижний угол (10, 10); противоположный угол (50, 40) уходит в (90, 70).
+        r.stretch(DVec2::new(10.0, 10.0), 2.0, 2.0);
+        assert_eq!(r, rect(10.0, 10.0, 80.0, 60.0));
+        // Растяжение с отражением: прямоугольник остаётся прямоугольником с положительными размерами.
+        r.stretch(DVec2::new(10.0, 10.0), -0.5, 1.0);
+        assert_eq!(r, rect(-30.0, 10.0, 40.0, 60.0));
+        let mut p = path(&[(0.0, 0.0, 0.5), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0)], true);
+        p.stretch(DVec2::ZERO, 2.0, 2.0);
+        assert_eq!(p.points()[2], DVec2::new(20.0, 20.0));
+        let SketchShape::Path { points, .. } = &p else { panic!() };
+        assert!((points[0].bulge - 0.5).abs() < 1e-12);
     }
 
     #[test]

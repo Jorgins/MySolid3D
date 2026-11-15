@@ -109,6 +109,15 @@ enum ImageDrag {
     Scale(DVec2),
 }
 
+/// Протяжка за вершину при одной уже выбранной вершине (она же «якорь»).
+#[derive(Clone, Copy)]
+enum VertexDrag {
+    /// Вершина выбрана и тянется она же: двигается вся фигура. Последняя точка курсора.
+    Shape { si: usize, last: DVec2 },
+    /// Тянется другая вершина той же фигуры: размер меняется, якорь стоит на месте.
+    Resize { si: usize, pi: usize, anchor: DVec2 },
+}
+
 /// Что мышь делает с группой выбранных фигур.
 #[derive(Clone, Copy)]
 enum GroupDrag {
@@ -148,6 +157,7 @@ struct SketchEdit {
     group_drag: Option<GroupDrag>,
     /// Вершины выбранной фигуры, отмеченные для скругления или фаски угла.
     corners: Vec<usize>,
+    vertex_drag: Option<VertexDrag>,
     /// Точки (и начало координат), выбранные стрелкой для связи: до двух.
     points_sel: Vec<Pick>,
     /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
@@ -177,6 +187,7 @@ impl SketchEdit {
             multi: Vec::new(),
             group_drag: None,
             corners: Vec::new(),
+            vertex_drag: None,
             points_sel: Vec::new(),
             line_menu: None,
             op: None,
@@ -1258,7 +1269,13 @@ impl App {
                 }
             };
         }
-        tool!(Tool::Select, select, "Выбор / перенос: щелчок выбирает фигуру, протяжка переносит её или её точку");
+        tool!(
+            Tool::Select,
+            select,
+            "Выбор / перенос: щелчок выбирает фигуру, протяжка переносит её или её точку.\n\
+             Щёлкните по вершине, чтобы отметить её: потом за неё тянется вся фигура, а за другую вершину \
+             меняется размер фигуры — отмеченная вершина остаётся на месте (Shift — пропорционально)."
+        );
         tool!(Tool::Line, line, "Линия: щелчками задавайте точки контура; щелчок по первой точке замыкает его");
         tool!(Tool::Arc, arc, "Дуга: щелчок — конец дуги, второй щелчок — точка, через которую она проходит");
         tool!(Tool::Rect, rect, "Прямоугольник: протяжкой от угла до угла");
@@ -2768,8 +2785,65 @@ impl App {
                 }
             }
             Tool::Select => {
-                // Сначала пробуем схватить точку контура, иначе — фигуру целиком.
+                // Одна вершина выбрана (якорь): за неё тянется вся фигура, а за другую вершину той же фигуры
+                // меняется размер — якорь остаётся на месте (Shift — пропорционально).
                 if resp.drag_started_by(primary) {
+                    edit.vertex_drag = None;
+                    if let ([Pick::Ref(DimRef::Point(s0, p0))], Some(p)) = (&edit.points_sel[..], press.and_then(raw_at)) {
+                        let (s0, p0) = (*s0, *p0);
+                        if let Some(pts) = sketch.shapes.get(s0).map(|s| s.points()) {
+                            let near = pts
+                                .iter()
+                                .enumerate()
+                                .map(|(i, q)| (i, (*q - p).length()))
+                                .filter(|(_, d)| *d < 8.0 * px)
+                                .min_by(|a, b| a.1.total_cmp(&b.1))
+                                .map(|(i, _)| i);
+                            if let (Some(pi), Some(anchor)) = (near, pts.get(p0).copied()) {
+                                edit.vertex_drag = Some(if pi == p0 {
+                                    VertexDrag::Shape { si: s0, last: p }
+                                } else {
+                                    VertexDrag::Resize { si: s0, pi, anchor }
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(vd) = edit.vertex_drag {
+                    if resp.drag_stopped_by(primary) || !resp.dragged_by(primary) {
+                        edit.vertex_drag = None;
+                    } else if let Some(cur) = pointer.and_then(raw_at).map(snap_pt) {
+                        match vd {
+                            VertexDrag::Shape { si, last } => {
+                                edit.selected = Some(si);
+                                if let Some(shape) = sketch.shapes.get_mut(si) {
+                                    shape.translate(cur - last);
+                                }
+                                edit.vertex_drag = Some(VertexDrag::Shape { si, last: cur });
+                            }
+                            VertexDrag::Resize { si, pi, anchor } => {
+                                edit.selected = Some(si);
+                                let proportional = ui.input(|i| i.modifiers.shift);
+                                if let Some(shape) = sketch.shapes.get_mut(si) {
+                                    if let Some(v) = shape.points().get(pi).copied() {
+                                        let (old, new) = (v - anchor, cur - anchor);
+                                        let ratio = |n: f64, o: f64| if o.abs() > 1e-9 { n / o } else { 1.0 };
+                                        let (mut sx, mut sy) = (ratio(new.x, old.x), ratio(new.y, old.y));
+                                        if proportional && old.length() > 1e-9 {
+                                            sx = new.length() / old.length();
+                                            sy = sx;
+                                        }
+                                        if sx.is_finite() && sy.is_finite() && sx.abs() > 0.01 && sy.abs() > 0.01 {
+                                            shape.stretch(anchor, sx, sy);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Сначала пробуем схватить точку контура, иначе — фигуру целиком.
+                if resp.drag_started_by(primary) && edit.vertex_drag.is_none() {
                     edit.drag_vertex = press.and_then(raw_at).and_then(|p| {
                         sketch.shapes.iter().enumerate().find_map(|(si, s)| match s {
                             SketchShape::Path { points, .. } => {
@@ -2792,7 +2866,7 @@ impl App {
                         edit.drag_vertex = None;
                     }
                 }
-                let mut dragging_vertex = edit.drag_vertex.is_some();
+                let mut dragging_vertex = edit.drag_vertex.is_some() || edit.vertex_drag.is_some();
                 let pick = |sketch: &Sketch, p: DVec2| {
                     sketch
                         .shapes
