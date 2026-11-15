@@ -5,6 +5,7 @@ mod app;
 mod camera;
 mod model;
 mod render;
+mod server;
 mod svg;
 
 use eframe::egui;

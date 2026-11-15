@@ -6,6 +6,8 @@ use crate::model::{
     RenderMesh, Sketch, SketchImage, SketchShape, TreeItem, MIN_SIZE,
 };
 use crate::render::{DrawParams, RenderMode, Renderer};
+
+mod api;
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Painter, PointerButton, Pos2, Rect, Response, Stroke, Vec2,
 };
@@ -616,6 +618,10 @@ pub struct App {
     view_rect: Rect,
     /// Загруженная картинка-подложка: (путь, текстура и отношение высоты к ширине).
     image_tex: std::collections::HashMap<String, Option<(egui::TextureHandle, f32)>>,
+    /// Сервер для управления программой извне (нейросети, скрипты) и очередь его запросов.
+    api: Option<crate::server::ApiServer>,
+    api_rx: Option<std::sync::mpsc::Receiver<crate::server::ApiRequest>>,
+    api_port: u16,
     /// Область (номер фигуры), на строку которой наведён курсор в свойствах вытягивания: подсвечивается на виде.
     region_hover: Option<usize>,
     /// История для отмены и повтора: состояния детали до каждого изменения.
@@ -737,6 +743,9 @@ impl App {
             view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0)),
             image_tex: Default::default(),
             region_hover: None,
+            api: None,
+            api_rx: None,
+            api_port: 8765,
             undo: Vec::new(),
             redo: Vec::new(),
             base: Part::default(),
@@ -759,8 +768,26 @@ impl App {
         };
         app.reset_history();
         // Файл детали можно передать аргументом командной строки (в т.ч. «Открыть с помощью»).
-        if let Some(path) = std::env::args_os().nth(1) {
+        // Ключ `--api` (или `--api=порт`) включает сервер для нейросетей.
+        let mut api_on = false;
+        let mut file = None;
+        for arg in std::env::args_os().skip(1) {
+            match arg.to_string_lossy().strip_prefix("--api") {
+                Some(rest) => {
+                    api_on = true;
+                    if let Some(port) = rest.strip_prefix('=').and_then(|p| p.parse::<u16>().ok()) {
+                        app.api_port = port;
+                    }
+                }
+                None => file = file.or(Some(arg)),
+            }
+        }
+        if let Some(path) = file {
             app.load(Path::new(&path));
+        }
+        if api_on {
+            let ctx = cc.egui_ctx.clone();
+            app.api_set_enabled(&ctx, true);
         }
         Ok(app)
     }
@@ -1214,6 +1241,20 @@ impl App {
             if ui.button("Сохранить как…").clicked() {
                 self.save_as();
                 ui.close();
+            }
+            ui.separator();
+            let mut api_on = self.api.is_some();
+            if ui
+                .checkbox(&mut api_on, "API для нейросетей")
+                .on_hover_text(format!(
+                    "Локальный сервер http://127.0.0.1:{}/ — через него нейросети и скрипты строят детали.
+Инструкция открывается по этому адресу.",
+                    self.api_port
+                ))
+                .changed()
+            {
+                let ctx = ui.ctx().clone();
+                self.api_set_enabled(&ctx, api_on);
             }
             ui.separator();
             if ui.button("Экспорт STL (для печати)…").clicked() {
@@ -3838,6 +3879,7 @@ impl eframe::App for App {
             self.face_hl = highlighted;
             self.colors_dirty = true;
         }
+        self.api_poll(frame);
         if self.dirty {
             self.rebuild(frame);
         }
