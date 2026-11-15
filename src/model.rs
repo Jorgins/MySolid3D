@@ -1330,6 +1330,10 @@ pub struct Part {
     pub face_colors: Vec<FaceColor>,
     #[serde(skip)]
     cache: Cache,
+    /// Направления рёбер скруглений и фасок (по номеру элемента): помогают найти те же рёбра,
+    /// когда изменение размеров сдвинуло их.
+    #[serde(default)]
+    edge_dirs: std::collections::BTreeMap<u64, Vec<DVec3>>,
 }
 
 impl Part {
@@ -1598,7 +1602,14 @@ impl Part {
                 if *size < MIN_SIZE {
                     return Err(format!("{size_name} должен быть больше нуля"));
                 }
-                let found = find_edges(body, edges)?;
+                let id = self.features[index].id;
+                let known = self.edge_dirs.get(&id).filter(|d| d.len() == edges.len()).cloned().unwrap_or_default();
+                let (mut found, mut mids, mut dirs) = (Vec::new(), Vec::new(), Vec::new());
+                for (edge, mid, dir) in find_edges(body, edges, &known)? {
+                    found.push(edge);
+                    mids.push(mid);
+                    dirs.push(dir);
+                }
                 let build = |order: &[&Edge]| {
                     if chamfer {
                         body.try_chamfer_edges(*size, order.iter().copied())
@@ -1612,8 +1623,10 @@ impl Part {
                         if let FeatureKind::Fillet { edges: stored, .. } | FeatureKind::Chamfer { edges: stored, .. } =
                             &mut self.features[index].kind
                         {
-                            *stored = order.iter().map(|&i| edges[i]).collect();
+                            // Заодно запоминаем, где рёбра теперь: так они переживают изменение размеров.
+                            *stored = order.iter().map(|&i| mids[i]).collect();
                         }
+                        self.edge_dirs.insert(id, order.iter().map(|&i| dirs[i]).collect());
                         Ok(Some(shape))
                     }
                     Err(e) => Err(format!("не удалось построить {what} — {e}")),
@@ -1688,27 +1701,72 @@ fn polyline_distance(pts: &[DVec3], p: DVec3) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-/// Находит рёбра тела по запомненным точкам на них.
-fn find_edges(body: &Shape, refs: &[DVec3]) -> Result<Vec<Edge>, String> {
+/// Направление ребра (от начала к концу); у замкнутых и кривых рёбер без определённого направления — ноль.
+fn polyline_dir(pts: &[DVec3]) -> DVec3 {
+    match (pts.first(), pts.last()) {
+        (Some(a), Some(b)) => (*b - *a).try_normalize().unwrap_or(DVec3::ZERO),
+        _ => DVec3::ZERO,
+    }
+}
+
+/// Находит рёбра тела по запомненным серединам. Сначала точное совпадение (точка лежит на ребре);
+/// если геометрия сдвинулась (изменили размер), ребро ищется среди рёбер того же направления
+/// (`dirs`, если они известны) по ближайшей середине, но только когда ответ однозначен.
+/// Возвращает рёбра, их нынешние середины и направления — их запоминают, чтобы следующий
+/// пересчёт нашёл рёбра точно.
+fn find_edges(body: &Shape, refs: &[DVec3], dirs: &[DVec3]) -> Result<Vec<(Edge, DVec3, DVec3)>, String> {
     if refs.is_empty() {
         return Err("не выбрано ни одного ребра".into());
     }
-    let mut edges: Vec<(Edge, Vec<DVec3>)> =
-        body.edges().map(|e| { let pts = e.approximation_segments().collect(); (e, pts) }).collect();
-    let mut found = Vec::new();
-    for r in refs {
+    let mut edges: Vec<Option<(Edge, Vec<DVec3>)>> =
+        body.edges().map(|e| { let pts = e.approximation_segments().collect(); Some((e, pts)) }).collect();
+    let mut found: Vec<Option<(Edge, DVec3, DVec3)>> = refs.iter().map(|_| None).collect();
+    let take = |edges: &mut Vec<Option<(Edge, Vec<DVec3>)>>, i: usize| {
+        let (edge, pts) = edges[i].take().unwrap();
+        (edge, polyline_mid(&pts), polyline_dir(&pts))
+    };
+    // Точное совпадение.
+    for (k, r) in refs.iter().enumerate() {
         let best = edges
             .iter()
             .enumerate()
-            .map(|(i, (_, pts))| (i, polyline_distance(pts, *r)))
+            .filter_map(|(i, e)| e.as_ref().map(|(_, pts)| (i, polyline_distance(pts, *r))))
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .filter(|(_, d)| *d < 0.01);
-        match best {
-            Some((i, _)) => found.push(edges.swap_remove(i).0),
-            None => return Err("ребро не найдено — геометрия изменилась, выберите рёбра заново".into()),
+        if let Some((i, _)) = best {
+            found[k] = Some(take(&mut edges, i));
         }
     }
-    Ok(found)
+    // Остальные — по ближайшей середине среди рёбер того же направления.
+    for (k, r) in refs.iter().enumerate() {
+        if found[k].is_some() {
+            continue;
+        }
+        let want = dirs.get(k).copied().filter(|d| d.length() > 0.5);
+        let mut dists: Vec<(usize, f64)> = edges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|(_, pts)| (i, pts)))
+            .filter(|(_, pts)| {
+                let dir = polyline_dir(pts);
+                want.is_none_or(|w| dir.length() < 0.5 || dir.dot(w).abs() > 0.98)
+            })
+            .map(|(i, pts)| (i, (polyline_mid(pts) - *r).length()))
+            .collect();
+        dists.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Без известного направления ответ принимаем только при явном преимуществе.
+        let ratio = if want.is_some() { 0.9 } else { 0.6 };
+        // Одно ребро в теле встречается дважды (по разу у каждой из соседних граней) — дубликаты не в счёт.
+        let Some(&(i, best)) = dists.first() else {
+            return Err("ребро не найдено — геометрия изменилась, выберите рёбра заново".into());
+        };
+        let second = dists.iter().find(|d| d.1 > best + 1e-6).map(|d| d.1);
+        if second.is_some_and(|second| best >= second * ratio) {
+            return Err("ребро не найдено — геометрия изменилась, выберите рёбра заново".into());
+        }
+        found[k] = Some(take(&mut edges, i));
+    }
+    Ok(found.into_iter().flatten().collect())
 }
 
 pub struct EdgeInfo {
@@ -2213,6 +2271,30 @@ mod tests {
         part.remove(hole);
         assert!(Rc::ptr_eq(&first, &part.rebuild(None).unwrap()));
         assert_eq!(part.mesh(None).faces.len(), 6);
+    }
+
+    #[test]
+    fn fillet_follows_moved_edges() {
+        let _kernel = kernel();
+        let (mut part, _) = extruded(rect(0.0, 0.0, 40.0, 30.0), 10.0);
+        part.rebuild(None);
+        let mesh = part.mesh(None);
+        let mid = mesh
+            .edges
+            .iter()
+            .map(|e| e.mid)
+            .find(|m| (m.x - 40.0).abs() < 1e-6 && (m.z - 10.0).abs() < 1e-6)
+            .unwrap();
+        let fillet = part.add("Скругление", FeatureKind::Fillet { edges: vec![mid], radius: 2.0 });
+        part.rebuild(None);
+        assert!(part.feature(fillet).unwrap().error.is_none());
+        // Изменили размер эскиза: ребро сдвинулось, но скругление его находит и запоминает новое место.
+        let sketch = part.features[0].id;
+        part.sketch_mut(sketch).unwrap().shapes[0] = rect(0.0, 0.0, 55.0, 30.0);
+        part.rebuild(None);
+        assert_eq!(part.feature(fillet).unwrap().error, None);
+        let FeatureKind::Fillet { edges, .. } = &part.feature(fillet).unwrap().kind else { panic!() };
+        assert!((edges[0].x - 55.0).abs() < 1e-6, "{:?}", edges[0]);
     }
 
     #[test]
