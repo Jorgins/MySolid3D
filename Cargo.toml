@@ -3,6 +3,9 @@ name = "mysolid3d"
 version = "0.1.0"
 edition = "2021"
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 # CAD-ядро (B-rep, булевы операции, STL/STEP)
 opencascade = "0.3"
@@ -12,6 +15,8 @@ eframe = { version = "0.37", default-features = false, features = ["glow", "defa
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
+# Чтение картинок-подложек эскиза (PNG, JPEG)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Интерфейсные библиотеки оптимизируем и в отладочной сборке — иначе egui заметно медленнее.
 # (Точечно, а не "*": смена профиля у occt-sys запускает полную пересборку OpenCascade.)
@@ -26,6 +31,13 @@ opt-level = 2
 [profile.dev.package.egui_glow]
 opt-level = 2
 [profile.dev.package.glam]
+opt-level = 2
+
+# Свой код и обёртку ядра тоже оптимизируем: построение сетки, выбор граней и рёбер под курсором
+# в неоптимизированной сборке заметно тормозят. Само ядро (occt-sys) это не пересобирает.
+[profile.dev.package.mysolid3d]
+opt-level = 2
+[profile.dev.package.opencascade]
 opt-level = 2
 
 [profile.release]

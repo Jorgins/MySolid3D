@@ -7,13 +7,16 @@ const MESH_VS: &str = r#"#version 330 core
 layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_normal;
 layout(location = 2) in float a_face;
+layout(location = 3) in vec3 a_color;
 uniform mat4 u_view_proj;
 uniform mat3 u_normal_mat;
 out vec3 v_normal;
 flat out float v_face;
+flat out vec3 v_color;
 void main() {
     v_normal = u_normal_mat * a_normal;
     v_face = a_face;
+    v_color = a_color;
     gl_Position = u_view_proj * vec4(a_pos, 1.0);
 }
 "#;
@@ -21,6 +24,7 @@ void main() {
 const MESH_FS: &str = r#"#version 330 core
 in vec3 v_normal;
 flat in float v_face;
+flat in vec3 v_color;
 uniform float u_hover;
 uniform float u_selected;
 out vec4 o_color;
@@ -28,7 +32,7 @@ void main() {
     vec3 n = normalize(v_normal);
     if (!gl_FrontFacing) n = -n;
 
-    vec3 base = vec3(0.70, 0.74, 0.80);
+    vec3 base = v_color;
     // Полусферическая подсветка: небо сверху, тёплый отсвет снизу.
     vec3 ambient = mix(vec3(0.34, 0.32, 0.32), vec3(0.52, 0.55, 0.60), n.y * 0.5 + 0.5);
     vec3 key_dir = normalize(vec3(-0.45, 0.65, 0.62));
@@ -69,6 +73,8 @@ pub struct DrawParams {
     pub normal_mat: [f32; 9],
     pub hover: Option<usize>,
     pub selected: Option<usize>,
+    /// Каркасный режим: грани не рисуются, видны только рёбра.
+    pub wireframe: bool,
 }
 
 pub struct Renderer {
@@ -77,6 +83,8 @@ pub struct Renderer {
     mesh_vao: glow::VertexArray,
     mesh_vbo: glow::Buffer,
     mesh_ibo: glow::Buffer,
+    /// Цвет каждой вершины (r, g, b) — отдельным буфером, чтобы перекрашивать без пересборки сетки.
+    color_vbo: glow::Buffer,
     edge_vao: glow::VertexArray,
     edge_vbo: glow::Buffer,
     index_count: i32,
@@ -131,6 +139,10 @@ impl Renderer {
             gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 12);
             gl.enable_vertex_attrib_array(2);
             gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 24);
+            let color_vbo = gl.create_buffer()?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(color_vbo));
+            gl.enable_vertex_attrib_array(3);
+            gl.vertex_attrib_pointer_f32(3, 3, glow::FLOAT, false, 12, 0);
 
             let edge_vao = gl.create_vertex_array()?;
             let edge_vbo = gl.create_buffer()?;
@@ -148,6 +160,7 @@ impl Renderer {
                 mesh_vao,
                 mesh_vbo,
                 mesh_ibo,
+                color_vbo,
                 edge_vao,
                 edge_vbo,
                 index_count: 0,
@@ -176,6 +189,15 @@ impl Renderer {
         self.edge_vertex_count = (mesh.edge_lines.len() / 3) as i32;
     }
 
+    /// Цвета вершин: по три числа на вершину, в том же порядке, что и в сетке.
+    pub fn upload_colors(&mut self, gl: &glow::Context, colors: &[f32]) {
+        unsafe {
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.color_vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(colors), glow::DYNAMIC_DRAW);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+    }
+
     pub fn paint(&self, gl: &glow::Context, p: &DrawParams) {
         if self.index_count == 0 {
             return;
@@ -200,7 +222,9 @@ impl Renderer {
             gl.uniform_1_f32(loc("u_hover").as_ref(), id(p.hover));
             gl.uniform_1_f32(loc("u_selected").as_ref(), id(p.selected));
             gl.bind_vertex_array(Some(self.mesh_vao));
-            gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
+            if !p.wireframe {
+                gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
+            }
             gl.disable(glow::POLYGON_OFFSET_FILL);
 
             gl.use_program(Some(self.edge_program));
