@@ -585,6 +585,9 @@ pub struct Sketch {
     /// Какие области (номера фигур) вытягивает каждая операция (номер элемента); нет записи — области по умолчанию.
     #[serde(default)]
     pub region_sel: Vec<(u64, Vec<usize>)>,
+    /// Точки и отрезки более ранних эскизов в плоскости этого эскиза (обновляется перед показом; в файл не пишется).
+    #[serde(skip)]
+    pub ext_cache: std::collections::HashMap<ExtKey, (DVec2, DVec2)>,
 }
 
 /// Картинка-подложка эскиза. В файле детали хранится только путь к ней.
@@ -700,6 +703,16 @@ pub enum DimRef {
     /// Сегмент контура или сторона прямоугольника: (фигура, номер сегмента).
     Segment(usize, usize),
     Circle(usize),
+    /// Элемент более раннего эскиза (он только измеряется, не двигается): (эскиз, фигура, номер, это сегмент).
+    Ext(u64, usize, usize, bool),
+}
+
+/// Ключ элемента более раннего эскиза: (эскиз, фигура, номер точки или сегмента, это сегмент).
+pub type ExtKey = (u64, usize, usize, bool);
+
+/// Нельзя двигать при подгонке размера: начало координат и элементы других эскизов.
+fn immovable(r: DimRef) -> bool {
+    matches!(r, DimRef::Origin | DimRef::Ext(..))
 }
 
 /// Точка, которую стрелкой выбирают для связи: обычная точка (или начало координат) либо середина сегмента.
@@ -849,7 +862,7 @@ fn shift_chain(
 
 impl Sketch {
     pub fn new(plane: Plane, shapes: Vec<SketchShape>) -> Self {
-        Self { plane, shapes, dims: Vec::new(), image: None, dim_places: Vec::new(), region_sel: Vec::new() }
+        Self { plane, shapes, dims: Vec::new(), image: None, dim_places: Vec::new(), region_sel: Vec::new(), ext_cache: Default::default() }
     }
 
     /// Удаляет фигуру вместе с её размерами; размеры остальных фигур остаются на своих местах.
@@ -869,6 +882,7 @@ impl Sketch {
             DimRef::Point(s, i) => shift(s).map(|s| DimRef::Point(s, i)),
             DimRef::Segment(s, i) => shift(s).map(|s| DimRef::Segment(s, i)),
             DimRef::Circle(s) => shift(s).map(DimRef::Circle),
+            DimRef::Ext(..) => Some(r),
         };
         self.dims = self
             .dims
@@ -1032,7 +1046,7 @@ impl Sketch {
 
     /// Выбираемая точка рядом с `p`: сначала точки контура и начало координат, потом середины сегментов.
     pub fn pick_point(&self, p: DVec2, tol: f64) -> Option<Pick> {
-        if let Some(r @ (DimRef::Point(..) | DimRef::Origin)) = self.pick_ref(p, tol) {
+        if let Some(r @ (DimRef::Point(..) | DimRef::Origin | DimRef::Ext(_, _, _, false))) = self.pick_ref(p, tol) {
             return Some(Pick::Ref(r));
         }
         let mut best: Option<(f64, Pick)> = None;
@@ -1069,10 +1083,17 @@ impl Sketch {
             Pick::Ref(r) => r,
             Pick::Mid(s, i) => DimRef::Segment(s, i),
         };
-        if b == Pick::Ref(DimRef::Origin) {
-            return Err("начало координат неподвижно — выберите его первой точкой".into());
+        self.nudge(as_ref(a), as_ref(b), d)
+    }
+
+    /// Сдвигает `b` на `d` относительно `a`; если `b` неподвижен (начало координат, другой эскиз) —
+    /// вместо него на `-d` сдвигается `a`.
+    fn nudge(&mut self, a: DimRef, b: DimRef, d: DVec2) -> Result<(), String> {
+        match (immovable(a), immovable(b)) {
+            (true, true) => Err("оба элемента неподвижны — ничего двигать".into()),
+            (_, true) => self.move_ref(a, b, -d),
+            _ => self.move_ref(b, a, d),
         }
-        self.move_ref(as_ref(b), as_ref(a), d)
     }
 
     /// Элемент эскиза рядом с точкой `p`; точки важнее линий.
@@ -1085,6 +1106,13 @@ impl Sketch {
         }
         closer(&mut best, tol, p.length(), DimRef::Origin);
         if best.is_none() {
+            for (&(a, s, i, seg), (q, _)) in &self.ext_cache {
+                if !seg {
+                    closer(&mut best, tol, (*q - p).length(), DimRef::Ext(a, s, i, false));
+                }
+            }
+        }
+        if best.is_none() {
             for (s, shape) in self.shapes.iter().enumerate() {
                 if matches!(shape, SketchShape::Circle { .. }) {
                     closer(&mut best, tol, shape.outline_distance(p), DimRef::Circle(s));
@@ -1096,6 +1124,13 @@ impl Sketch {
                     let d = pts.windows(2).map(|w| segment_distance(w[0], w[1], p)).fold(f64::INFINITY, f64::min);
                     closer(&mut best, tol, d, DimRef::Segment(s, i));
                     i += 1;
+                }
+            }
+            if best.is_none() {
+                for (&(a, s, i, seg), (q0, q1)) in &self.ext_cache {
+                    if seg {
+                        closer(&mut best, tol, segment_distance(*q0, *q1, p), DimRef::Ext(a, s, i, true));
+                    }
                 }
             }
         }
@@ -1121,6 +1156,11 @@ impl Sketch {
                 Some(shape @ SketchShape::Circle { .. }) => shape.outline(),
                 _ => vec![],
             },
+            DimRef::Ext(a, s, i, seg) => match self.ext_cache.get(&(a, s, i, seg)) {
+                Some((p, q)) if seg => vec![*p, *q],
+                Some((p, _)) => vec![*p],
+                None => vec![],
+            },
         }
     }
 
@@ -1133,6 +1173,14 @@ impl Sketch {
                 (bulge == 0.0 && (b - a).length() > 1e-9).then_some(RefGeom::Line(a, b))
             }
             DimRef::Circle(_) => None,
+            DimRef::Ext(a, s, i, seg) => {
+                let (p, q) = *self.ext_cache.get(&(a, s, i, seg))?;
+                if !seg {
+                    Some(RefGeom::Point(p))
+                } else {
+                    ((q - p).length() > 1e-9).then_some(RefGeom::Line(p, q))
+                }
+            }
         }
     }
 
@@ -1240,8 +1288,8 @@ impl Sketch {
             Relation::Vertical => self.set_dim(&Dim::Distance(a, b, DimMode::Horizontal), 0.0),
             Relation::Midpoint => match (self.ref_geom(a), self.ref_geom(b)) {
                 // Первый элемент остаётся на месте: точка идёт к середине отрезка, а отрезок — к точке.
-                (Some(RefGeom::Line(p, q)), Some(RefGeom::Point(pt))) => self.move_ref(b, a, (p + q) * 0.5 - pt),
-                (Some(RefGeom::Point(pt)), Some(RefGeom::Line(p, q))) => self.move_ref(b, a, pt - (p + q) * 0.5),
+                (Some(RefGeom::Line(p, q)), Some(RefGeom::Point(pt))) => self.nudge(a, b, (p + q) * 0.5 - pt),
+                (Some(RefGeom::Point(pt)), Some(RefGeom::Line(p, q))) => self.nudge(a, b, pt - (p + q) * 0.5),
                 _ => Err("середина — это точка и отрезок".into()),
             },
             Relation::Parallel | Relation::Collinear => {
@@ -1403,12 +1451,8 @@ impl Sketch {
                 if d.length() < 1e-12 {
                     return Ok(());
                 }
-                // Начало координат неподвижно: если оно указано вторым, сдвигаем первый элемент.
-                if b == DimRef::Origin {
-                    self.move_ref(a, b, -d)
-                } else {
-                    self.move_ref(b, a, d)
-                }
+                // Начало координат и элементы других эскизов неподвижны: двигается тот, что свой.
+                self.nudge(a, b, d)
             }
             Dim::Angle(a, b) => {
                 if !(0.0..=180.0).contains(&value) {
@@ -1416,7 +1460,13 @@ impl Sketch {
                 }
                 let angle = self.line_angle(a, b).ok_or(DIM_GONE)?;
                 let sign = if angle < 0.0 { -1.0 } else { 1.0 };
-                self.rotate_ref(b, a, sign * value.to_radians() - angle)
+                let turn = sign * value.to_radians() - angle;
+                // Отрезок другого эскиза поворачивать нельзя — поворачивается свой, в обратную сторону.
+                match (immovable(a), immovable(b)) {
+                    (true, true) => Err("оба элемента неподвижны — ничего двигать".into()),
+                    (_, true) => self.rotate_ref(a, b, -turn),
+                    _ => self.rotate_ref(b, a, turn),
+                }
             }
         }
     }
@@ -1425,7 +1475,7 @@ impl Sketch {
     /// её целиком; внутри одной фигуры меняется её форма.
     fn move_ref(&mut self, moving: DimRef, fixed: DimRef, d: DVec2) -> Result<(), String> {
         let shape_of = |r: DimRef| match r {
-            DimRef::Origin => None,
+            DimRef::Origin | DimRef::Ext(..) => None,
             DimRef::Point(s, _) | DimRef::Segment(s, _) | DimRef::Circle(s) => Some(s),
         };
         let s = shape_of(moving).ok_or(DIM_GONE)?;
@@ -1634,6 +1684,34 @@ impl Part {
 
     pub fn feature_mut(&mut self, id: u64) -> Option<&mut Feature> {
         self.features.iter_mut().find(|f| f.id == id)
+    }
+
+    /// Точки и отрезки более ранних эскизов в плоскости эскиза `id`: к ним можно привязывать размеры.
+    /// Заполняет `Sketch::ext_cache`; вызывается перед показом эскиза при редактировании.
+    pub fn refresh_ext(&mut self, id: u64) {
+        let Some(index) = self.features.iter().position(|f| f.id == id) else { return };
+        let FeatureKind::Sketch(current) = &self.features[index].kind else { return };
+        let plane = current.plane;
+        let mut cache = std::collections::HashMap::new();
+        for f in &self.features[..index] {
+            let FeatureKind::Sketch(other) = &f.kind else { continue };
+            let local = |p: DVec2| plane.to_local(other.plane.to_world(p));
+            for (s, shape) in other.shapes.iter().enumerate() {
+                for (i, p) in shape.points().into_iter().enumerate() {
+                    cache.insert((f.id, s, i, false), (local(p), DVec2::ZERO));
+                }
+                let mut i = 0;
+                while let Some((a, b, bulge)) = shape.segment(i) {
+                    if bulge == 0.0 {
+                        cache.insert((f.id, s, i, true), (local(a), local(b)));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        if let Some(sketch) = self.sketch_mut(id) {
+            sketch.ext_cache = cache;
+        }
     }
 
     pub fn sketch(&self, id: u64) -> Option<&Sketch> {
@@ -2883,12 +2961,45 @@ mod tests {
         // Совпадение середин; начало координат — только первой точкой.
         s.align(mid_a, mid_b, Relation::Coincident).unwrap();
         assert!((s.pick_pos(mid_b).unwrap() - DVec2::new(10.0, 0.0)).length() < 1e-9);
-        assert!(s.align(mid_a, Pick::Ref(DimRef::Origin), Relation::Coincident).is_err());
         s.align(Pick::Ref(DimRef::Origin), mid_b, Relation::Vertical).unwrap();
         assert!(s.pick_pos(mid_b).unwrap().x.abs() < 1e-9);
         // Рядом с серединой отрезка она находится щелчком, а вершины важнее.
         assert_eq!(s.pick_point(DVec2::new(0.1, 0.1), 1.0), Some(Pick::Ref(DimRef::Point(0, 0))));
         assert!(matches!(s.pick_point(s.pick_pos(mid_a).unwrap() + DVec2::new(0.2, 0.0), 1.0), Some(Pick::Mid(0, 0))));
+    }
+
+    #[test]
+    fn dimension_to_previous_sketch() {
+        let _kernel = kernel();
+        let mut part = Part::default();
+        let first = part.add("Эскиз", FeatureKind::Sketch(Sketch::new(Plane::TOP, vec![rect(0.0, 0.0, 40.0, 30.0)])));
+        let second = part.add("Эскиз", FeatureKind::Sketch(Sketch::new(Plane::TOP, vec![rect(50.0, 5.0, 10.0, 10.0)])));
+        part.refresh_ext(second);
+        let sk = part.sketch(second).unwrap();
+        // Точки и стороны первого эскиза видны во втором и находятся щелчком.
+        let corner = sk.pick_ref(DVec2::new(40.2, 30.1), 1.0);
+        assert_eq!(corner, Some(DimRef::Ext(first, 0, 2, false)));
+        let side = sk.pick_ref(DVec2::new(20.0, 0.2), 1.0);
+        assert_eq!(side, Some(DimRef::Ext(first, 0, 0, true)));
+        // Расстояние от угла первого эскиза до угла нового: 10 по X и 25 по Y.
+        let near = DimRef::Point(0, 0);
+        let dim = sk.pair_dim(corner.unwrap(), near).unwrap();
+        assert_eq!(dim, Dim::Distance(corner.unwrap(), near, DimMode::Vertical));
+        assert!((sk.dim_value(&dim).unwrap() - 25.0).abs() < 1e-9);
+        // Новое значение двигает свою фигуру, внешняя остаётся на месте.
+        let sk = part.sketch_mut(second).unwrap();
+        sk.set_dim(&dim, 5.0).unwrap();
+        assert!((sk.shapes[0].points()[0].y - 25.0).abs() < 1e-9);
+        // Если внешний элемент указан вторым, всё равно двигается свой.
+        let flipped = Dim::Distance(near, corner.unwrap(), DimMode::Horizontal);
+        sk.set_dim(&flipped, 20.0).unwrap();
+        assert!((sk.shapes[0].points()[0].x - 60.0).abs() < 1e-9, "{:?}", sk.shapes[0].points());
+        // Расстояние от точки до стороны (внешний отрезок — первый).
+        let line_dim = sk.pair_dim(side.unwrap(), near).unwrap();
+        assert!((sk.dim_value(&line_dim).unwrap() - 25.0).abs() < 1e-9);
+        // Совпадение с внешней точкой: своя фигура встаёт на неё.
+        sk.align(Pick::Ref(corner.unwrap()), Pick::Ref(near), Relation::Coincident).unwrap();
+        assert!((sk.shapes[0].points()[0] - DVec2::new(40.0, 30.0)).length() < 1e-9);
     }
 
     #[test]

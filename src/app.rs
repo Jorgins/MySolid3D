@@ -2498,6 +2498,7 @@ impl App {
 
     /// Режим эскиза: рисование фигур, перенос, размеры.
     fn sketch_mode(&mut self, ui: &egui::Ui, resp: &Response, painter: &Painter, rect: Rect, edit: &mut SketchEdit) {
+        self.part.refresh_ext(edit.id);
         let Some(plane) = self.part.sketch(edit.id).map(|s| s.plane) else { return };
         if let Some(img) = self.part.sketch(edit.id).and_then(|s| s.image.clone()) {
             self.draw_image(painter, rect, &img, &plane);
@@ -3143,6 +3144,16 @@ impl App {
             }
         }
         if edit.tool == Tool::Dimension {
+            // Элементы более ранних эскизов: к ним тоже можно привязать размер.
+            let pale = Color32::from_rgba_unmultiplied(120, 190, 255, 170);
+            for (&(_, _, _, seg), (a, b)) in sketch.ext_cache.iter().take(4000) {
+                if seg {
+                    let line: Vec<Pos2> = [*a, *b].iter().map(|q| cam.project(rect, plane.to_world(*q))).collect();
+                    painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, pale), 5.0, 4.0));
+                } else if let Some(pos) = dot_at(*a) {
+                    painter.circle_filled(pos, 3.0, pale);
+                }
+            }
             for q in sketch.shapes.iter().flat_map(|shape| shape.points()) {
                 if let Some(pos) = dot_at(q) {
                     painter.circle_stroke(pos, 5.0, Stroke::new(1.5, SKETCH_COLOR));
