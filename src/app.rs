@@ -636,7 +636,7 @@ impl App {
         if !self.building {
             self.build_clean = self.history_clean();
         }
-        let (shape, pending) = self.part.rebuild_step(stop, 1);
+        let (shape, pending) = self.part.rebuild_timed(stop, std::time::Duration::from_millis(150));
         self.shape = shape;
         self.mesh = self.part.mesh(stop);
         if let Some(gl) = frame.gl() {

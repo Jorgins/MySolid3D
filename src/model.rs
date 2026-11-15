@@ -8,6 +8,8 @@ use std::rc::Rc;
 pub const MIN_SIZE: f64 = 0.01;
 const THROUGH_ALL: f64 = 10_000.0;
 const MESH_TOLERANCE: f64 = 0.02;
+/// Для проверки целостности поверхности хватает грубой сетки — она строится заметно быстрее.
+const TORN_CHECK_TOLERANCE: f64 = 0.08;
 /// Насколько может сместиться центр грани, чтобы она считалась той же самой.
 const FACE_MATCH: f64 = 0.05;
 
@@ -1509,6 +1511,22 @@ impl Part {
         self.rebuild_step(stop_before, usize::MAX).0
     }
 
+    /// Пересчёт по времени: строит элементы, пока не пройдёт `limit`, и сообщает, на чём остановился.
+    /// Одна сетка на пачку элементов выходит заметно дешевле, чем по сетке на каждый элемент.
+    pub fn rebuild_timed(
+        &mut self,
+        stop_before: Option<u64>,
+        limit: std::time::Duration,
+    ) -> (Option<Rc<Shape>>, Option<usize>) {
+        let start = std::time::Instant::now();
+        loop {
+            let (shape, pending) = self.rebuild_step(stop_before, 1);
+            if pending.is_none() || start.elapsed() >= limit {
+                return (shape, pending);
+            }
+        }
+    }
+
     /// Пересчёт по частям: строит не больше `budget` элементов, которых нет в кэше, и возвращает
     /// тело на этот момент и номер элемента, на котором остановился (`None` — всё построено).
     /// Так интерфейс может показывать, как деталь строится, и не замирает на всё время пересчёта.
@@ -1647,6 +1665,23 @@ impl Part {
     }
 }
 
+/// Число рёбер сетки с нечётным числом треугольников (признак разорванной поверхности).
+/// Как `RenderMesh::torn_edges`, но по одной грубой сетке всего тела, без остальной подготовки к показу.
+fn torn_edges_of(shape: &Shape) -> usize {
+    let Ok(mesh) = shape.mesh_with_tolerance(TORN_CHECK_TOLERANCE) else { return 0 };
+    let key = |p: DVec3| [(p.x * 1e3).round() as i64, (p.y * 1e3).round() as i64, (p.z * 1e3).round() as i64];
+    let mut count = std::collections::HashMap::new();
+    for t in mesh.indices.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (key(mesh.vertices[t[k]]), key(mesh.vertices[t[(k + 1) % 3]]));
+            if a != b {
+                *count.entry((a.min(b), a.max(b))).or_insert(0usize) += 1;
+            }
+        }
+    }
+    count.values().filter(|&&c| c % 2 == 1).count()
+}
+
 /// Скругление или фаска с проверкой результата. На сложных цепочках рёбер ядро иногда строит
 /// дефектные грани (поверхность тела выглядит разорванной), причём исход зависит от порядка,
 /// в котором переданы рёбра. Поэтому пробуем несколько порядков и берём первый результат
@@ -1672,8 +1707,8 @@ fn blend_edges(
             // Вывернутую грань выдаёт отрицательная площадь. Эта проверка мгновенная, а сетка
             // для такой грани может строиться минуту — до сетки дело доводим только без неё.
             if shape.faces().all(|f| f.surface_area() > 0.0) {
-                let torn = RenderMesh::from_shape(&shape).torn_edges();
-                if torn == 0 || torn <= *allowed.get_or_insert_with(|| RenderMesh::from_shape(body).torn_edges()) {
+                let torn = torn_edges_of(&shape);
+                if torn == 0 || torn <= *allowed.get_or_insert_with(|| torn_edges_of(body)) {
                     return Ok((shape, order));
                 }
             }
