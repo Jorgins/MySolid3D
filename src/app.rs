@@ -165,6 +165,16 @@ fn tool_button(ui: &mut egui::Ui, icon: &egui::TextureHandle, tip: &str, selecte
     ui.add(egui::Button::image(image).selected(selected)).on_hover_text(tip).clicked()
 }
 
+/// Квадратик цвета в палитре; `true` — по нему щёлкнули.
+fn swatch(ui: &mut egui::Ui, c: [u8; 3]) -> bool {
+    let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r.expand(2.0), 4.0, Color32::WHITE);
+    }
+    ui.painter().rect_filled(r, 3.0, Color32::from_rgb(c[0], c[1], c[2]));
+    resp.clicked()
+}
+
 /// Красный крестик в правом верхнем углу вида: выйти из эскиза.
 fn exit_button(ui: &egui::Ui, rect: Rect) -> bool {
     let mut clicked = false;
@@ -439,6 +449,17 @@ pub struct App {
     build_clean: bool,
     /// Подсвеченные (выбранные) грани, как они переданы в видеокарту.
     face_hl: Vec<usize>,
+    /// Что красит палитра: всю деталь (иначе выбранные грани).
+    paint_part: bool,
+    had_faces: bool,
+    /// Открыт вопрос «сохранить под текущим названием или как…».
+    ask_save: bool,
+    /// Раскрыта ли раскладушка с переходными цветами.
+    palette_open: bool,
+    /// Файл, в который сохраняется деталь (Ctrl+S), и её состояние в момент сохранения.
+    file: Option<PathBuf>,
+    saved_json: String,
+    title: String,
     /// Последние введённые размеры — подставляются в новые элементы.
     last_fillet: f64,
     last_chamfer: f64,
@@ -518,6 +539,13 @@ impl App {
             fit_while_building: false,
             build_clean: false,
             face_hl: Vec::new(),
+            paint_part: true,
+            had_faces: false,
+            ask_save: false,
+            palette_open: false,
+            file: None,
+            saved_json: String::new(),
+            title: String::new(),
             last_fillet: 2.0,
             last_chamfer: 1.0,
             last_depth: 10.0,
@@ -598,6 +626,7 @@ impl App {
         self.undo.clear();
         self.redo.clear();
         self.commit_base();
+        self.saved_json = self.base_json.clone();
     }
 
     /// В конце кадра, когда кнопка мыши отпущена и ничего не вводится, запоминает сделанное изменение.
@@ -779,21 +808,74 @@ impl App {
         self.cam = Camera::default();
         self.status.clear();
         self.dirty = true;
+        self.file = None;
         self.reset_history();
     }
 
+    /// Кнопка «Сохранить» и Ctrl+S: у открытого файла сначала спрашиваем, куда сохранять.
     fn save(&mut self) {
-        let Some(path) =
-            rfd::FileDialog::new().add_filter("Деталь MySolid3D", &["ms3d"]).set_file_name("деталь.ms3d").save_file()
-        else {
+        if self.file.is_some() {
+            self.ask_save = true;
+        } else {
+            self.save_as();
+        }
+    }
+
+    fn save_question(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.file.clone().filter(|_| self.ask_save) else {
+            self.ask_save = false;
             return;
         };
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let (mut here, mut other, mut cancel) = (false, false, false);
+        egui::Window::new("Сохранение")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Сохранить под текущим названием «{name}» или сохранить как новый файл?"));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    here = ui.button("Сохранить под текущим").clicked();
+                    other = ui.button("Сохранить как…").clicked();
+                    cancel = ui.button("Отмена").clicked();
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if here || other || cancel {
+            self.ask_save = false;
+        }
+        if here {
+            self.write_to(&path);
+        } else if other {
+            self.save_as();
+        }
+    }
+
+    fn save_as(&mut self) {
+        let name = self
+            .file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or("деталь.ms3d".into(), |n| n.to_string_lossy().into_owned());
+        if let Some(path) =
+            rfd::FileDialog::new().add_filter("Деталь MySolid3D", &["ms3d"]).set_file_name(name).save_file()
+        {
+            self.write_to(&path);
+        }
+    }
+
+    fn write_to(&mut self, path: &Path) {
         let result = serde_json::to_string_pretty(&self.part)
             .map_err(|e| e.to_string())
-            .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
+            .and_then(|json| std::fs::write(path, json).map_err(|e| e.to_string()));
         self.status = match result {
             Ok(()) => {
-                self.remember_file(&path, true);
+                self.remember_file(path, true);
+                self.file = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
+                self.saved_json = serde_json::to_string(&self.part).unwrap_or_default();
                 format!("Сохранено: {}", path.display())
             }
             Err(e) => format!("Не удалось сохранить: {e}"),
@@ -832,6 +914,7 @@ impl App {
                 self.new_part();
                 self.part = part;
                 self.reset_history();
+                self.file = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
                 self.need_fit = true;
                 self.fit_while_building = true;
                 self.remember_file(path, true);
@@ -899,10 +982,15 @@ impl App {
         if tool_button(ui, &self.icons.open_file, "Открыть деталь…", false) {
             self.open();
         }
-        if tool_button(ui, &self.icons.save_file, "Сохранить деталь…", false) {
+        if tool_button(ui, &self.icons.save_file, "Сохранить деталь (Ctrl+S)", false) {
             self.save();
         }
         ui.menu_button("Файл", |ui| {
+            if ui.button("Сохранить как…").clicked() {
+                self.save_as();
+                ui.close();
+            }
+            ui.separator();
             if ui.button("Экспорт STL (для печати)…").clicked() {
                 self.export(false);
                 ui.close();
@@ -1681,50 +1769,83 @@ impl App {
             Selection::Faces(list) => list.iter().filter_map(|&i| self.mesh.faces.get(i)).map(|f| f.origin).collect(),
             _ => vec![],
         };
+        // Выбрали грань — по умолчанию красится она; сняли выбор — вся деталь. Переключатель решает вручную.
+        if faces.is_empty() == self.had_faces {
+            self.paint_part = faces.is_empty();
+            self.had_faces = !faces.is_empty();
+        }
+        let part_mode = self.paint_part;
         let mut pick: Option<Option<[u8; 3]>> = None;
+        let mut mode = part_mode;
         egui::Area::new(egui::Id::unique("color_palette")).fixed_pos(rect.left_top() + Vec2::splat(8.0)).show(
             ui.ctx(),
             |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.weak(if faces.is_empty() { "Цвет детали:" } else { "Цвет граней:" });
+                        ui.weak("Красить:");
+                        if ui
+                            .selectable_label(!mode, "Грань")
+                            .on_hover_text("Выберите грань (Ctrl+щелчок — несколько) и цвет")
+                            .clicked()
+                        {
+                            mode = false;
+                        }
+                        if ui.selectable_label(mode, "Деталь").on_hover_text("Покрасить весь объект").clicked() {
+                            mode = true;
+                        }
+                        ui.separator();
                         for c in PALETTE {
-                            let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
-                            if resp.hovered() {
-                                ui.painter().rect_filled(r.expand(2.0), 4.0, Color32::WHITE);
-                            }
-                            ui.painter().rect_filled(r, 3.0, Color32::from_rgb(c[0], c[1], c[2]));
-                            if resp.clicked() {
+                            if swatch(ui, c) {
                                 pick = Some(Some(c));
                             }
                         }
-                        let tip = if !faces.is_empty() {
-                            "Вернуть граням цвет детали"
-                        } else {
+                        let tip = if part_mode {
                             "Вернуть стандартный цвет детали и всех граней"
+                        } else {
+                            "Вернуть выбранным граням цвет детали"
                         };
                         if ui.small_button("Сброс").on_hover_text(tip).clicked() {
                             pick = Some(None);
                         }
+                        let arrow = if self.palette_open { "▴" } else { "▾" };
+                        if ui.small_button(arrow).on_hover_text("Переходные цвета между основными").clicked() {
+                            self.palette_open = !self.palette_open;
+                        }
                     });
+                    if self.palette_open {
+                        // Раскладушка: между каждой парой соседних цветов — три промежуточных оттенка.
+                        for t in [0.25f32, 0.5, 0.75] {
+                            ui.horizontal(|ui| {
+                                for pair in PALETTE.windows(2) {
+                                    let mix = |k: usize| (pair[0][k] as f32 * (1.0 - t) + pair[1][k] as f32 * t).round() as u8;
+                                    let c = [mix(0), mix(1), mix(2)];
+                                    if swatch(ui, c) {
+                                        pick = Some(Some(c));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    if !part_mode && faces.is_empty() {
+                        ui.colored_label(SELECT_COLOR, "Щёлкните по грани детали, которую нужно покрасить");
+                    }
                 });
             },
         );
+        self.paint_part = mode;
         if let Some(color) = pick {
-            match faces.is_empty() {
-                false => {
-                    for point in faces {
-                        self.part.set_face_color(point, color);
-                    }
-                    // Снимаем выделение — иначе подсветка выбора закрывает новый цвет.
-                    self.selection = Selection::None;
+            if part_mode {
+                self.part.color = color;
+                // Красим весь объект — прежние цвета отдельных граней больше не нужны.
+                self.part.face_colors.clear();
+            } else if faces.is_empty() {
+                self.status = "Сначала выберите грань (Ctrl+щелчок — несколько) или переключитесь на «Деталь»".into();
+            } else {
+                for point in faces {
+                    self.part.set_face_color(point, color);
                 }
-                true => {
-                    self.part.color = color;
-                    if color.is_none() {
-                        self.part.face_colors.clear();
-                    }
-                }
+                // Снимаем выделение — иначе подсветка выбора закрывает новый цвет.
+                self.selection = Selection::None;
             }
             self.colors_dirty = true;
         }
@@ -2559,6 +2680,20 @@ impl eframe::App for App {
                 self.undo();
             }
         }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.save();
+        }
+        let modified = self.dirty || self.base_json != self.saved_json;
+        let name = self
+            .file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or("новая деталь".into(), |n| n.to_string_lossy().into_owned());
+        let title = format!("MySolid3D — {name}{}", if modified { " *" } else { "" });
+        if title != self.title {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         let highlighted = match &self.selection {
             Selection::Faces(list) => list.clone(),
             _ => vec![],
@@ -2598,6 +2733,7 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
         self.sketch_op_window(ui.ctx());
+        self.save_question(ui.ctx());
         self.track_history(ui.ctx());
 
         if self.dirty {
