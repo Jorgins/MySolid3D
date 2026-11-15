@@ -177,3 +177,54 @@ impl Camera {
         [r.x, u.x, e.x, r.y, u.y, e.y, r.z, u.z, e.z].map(|v| v as f32)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Экранные координаты по матрице для OpenGL (так их видит видеокарта).
+    fn via_matrix(cam: &Camera, rect: Rect, p: DVec3, depth: f64) -> (f32, f32, f32) {
+        let m = cam.view_proj(rect, depth).map(|v| v as f64);
+        let clip = |row: usize| m[row] * p.x + m[4 + row] * p.y + m[8 + row] * p.z + m[12 + row];
+        let w = clip(3);
+        let (x, y, z) = (clip(0) / w, clip(1) / w, clip(2) / w);
+        (
+            rect.center().x + (x * rect.width() as f64 * 0.5) as f32,
+            rect.center().y - (y * rect.height() as f64 * 0.5) as f32,
+            z as f32,
+        )
+    }
+
+    #[test]
+    fn matrix_and_projection_agree() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(800.0, 600.0));
+        for perspective in [false, true] {
+            let mut cam = Camera::default();
+            cam.perspective = perspective;
+            cam.fov = 50.0;
+            cam.target = DVec3::new(10.0, -5.0, 3.0);
+            cam.scale = 6.0;
+            let points = [
+                DVec3::new(10.0, -5.0, 3.0),
+                DVec3::new(40.0, 20.0, 10.0),
+                DVec3::new(-30.0, 15.0, -12.0),
+                DVec3::new(5.0, -60.0, 25.0),
+            ];
+            for p in points {
+                let (mx, my, mz) = via_matrix(&cam, rect, p, 500.0);
+                let s = cam.project(rect, p);
+                assert!((mx - s.x).abs() < 0.05 && (my - s.y).abs() < 0.05, "{perspective}: {mx},{my} против {s:?}");
+                assert!((-1.0..=1.0).contains(&mz), "глубина вне диапазона: {mz}");
+                // Луч из этого пикселя проходит через саму точку.
+                let (o, d) = cam.ray(rect, s);
+                let miss = (p - o).cross(d).length();
+                assert!(miss < 0.05, "{perspective}: луч мимо точки на {miss}");
+            }
+            // Ближе к камере — крупнее (только в перспективе); цель на месте в обоих режимах.
+            let near = cam.project(rect, cam.target + cam.up() * 10.0 + cam.eye_dir() * 30.0);
+            let far = cam.project(rect, cam.target + cam.up() * 10.0 - cam.eye_dir() * 30.0);
+            let (near_h, far_h) = (rect.center().y - near.y, rect.center().y - far.y);
+            assert_eq!(near_h > far_h + 0.5, perspective, "{perspective}: {near_h} {far_h}");
+        }
+    }
+}
