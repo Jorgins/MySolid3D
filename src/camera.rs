@@ -9,13 +9,21 @@ pub struct Camera {
     pub yaw: f64,
     pub pitch: f64,
     pub target: DVec3,
-    /// Пикселей на миллиметр.
+    /// Пикселей на миллиметр (в плоскости, проходящей через цель).
     pub scale: f64,
+    /// Перспектива включена (иначе параллельная проекция).
+    pub perspective: bool,
+    /// Угол обзора по вертикали в градусах: чем он больше, тем сильнее перспектива.
+    pub fov: f64,
+    /// В эскизе вид всегда параллельный — чертить в перспективе неудобно.
+    pub flat: bool,
+    /// Камера не подходит к цели ближе этого расстояния (мм), чтобы деталь не оказалась за спиной.
+    pub min_dist: f64,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        let mut c = Camera { yaw: 0.0, pitch: 0.0, target: DVec3::ZERO, scale: 4.0 };
+        let mut c = Camera { yaw: 0.0, pitch: 0.0, target: DVec3::ZERO, scale: 4.0, perspective: false, fov: 40.0, flat: false, min_dist: 0.0 };
         c.set_iso();
         c
     }
@@ -53,12 +61,28 @@ impl Camera {
         self.yaw = if n.z.abs() > 0.999 { (-plane.x.x).atan2(plane.x.y) } else { n.y.atan2(n.x) };
     }
 
+    /// Расстояние от глаза до цели в перспективе; `None` — проекция параллельная.
+    /// Выбрано так, чтобы вертикальный угол обзора был `fov` (но не ближе `min_dist`).
+    fn eye_distance(&self, rect: Rect) -> Option<f64> {
+        if !self.perspective || self.flat {
+            return None;
+        }
+        let half_height = rect.height().max(1.0) as f64 * 0.5 / self.scale;
+        let tan = (self.fov.clamp(5.0, 120.0).to_radians() * 0.5).tan();
+        Some((half_height / tan).max(self.min_dist).max(1e-3))
+    }
+
     pub fn project(&self, rect: Rect, p: DVec3) -> Pos2 {
         let d = p - self.target;
         let c = rect.center();
+        // В перспективе всё, что дальше цели, мельче, а ближе — крупнее.
+        let k = match self.eye_distance(rect) {
+            Some(dist) => dist / (dist - d.dot(self.eye_dir())).max(dist * 1e-3),
+            None => 1.0,
+        };
         Pos2::new(
-            c.x + (d.dot(self.right()) * self.scale) as f32,
-            c.y - (d.dot(self.up()) * self.scale) as f32,
+            c.x + (d.dot(self.right()) * self.scale * k) as f32,
+            c.y - (d.dot(self.up()) * self.scale * k) as f32,
         )
     }
 
@@ -68,7 +92,14 @@ impl Camera {
         let f = self.forward();
         let on_plane = self.target + self.right() * (o.x as f64 / self.scale)
             - self.up() * (o.y as f64 / self.scale);
-        (on_plane - f * 1.0e5, f)
+        match self.eye_distance(rect) {
+            // Из глаза через точку экрана.
+            Some(dist) => {
+                let eye = self.target - f * dist;
+                (eye, (on_plane - eye).normalize())
+            }
+            None => (on_plane - f * 1.0e5, f),
+        }
     }
 
     /// Точка экрана в координатах плоскости эскиза.
@@ -112,6 +143,22 @@ impl Camera {
     /// Матрица мир → clip-пространство OpenGL (по столбцам).
     pub fn view_proj(&self, rect: Rect, depth_range: f64) -> [f32; 16] {
         let (r, u, f, t) = (self.right(), self.up(), self.forward(), self.target);
+        if let Some(dist) = self.eye_distance(rect) {
+            // Перспектива: w = расстояние от глаза вдоль взгляда, глубина — по формуле OpenGL.
+            let sx = self.scale * dist / (rect.width().max(1.0) as f64 * 0.5);
+            let sy = self.scale * dist / (rect.height().max(1.0) as f64 * 0.5);
+            let (near, far) = ((dist * 0.01).max(0.05), dist + depth_range);
+            let a = (far + near) / (far - near);
+            let b = -2.0 * far * near / (far - near);
+            let ft = dist - f.dot(t);
+            return [
+                r.x * sx, u.x * sy, a * f.x, f.x,
+                r.y * sx, u.y * sy, a * f.y, f.y,
+                r.z * sx, u.z * sy, a * f.z, f.z,
+                -r.dot(t) * sx, -u.dot(t) * sy, a * ft + b, ft,
+            ]
+            .map(|v| v as f32);
+        }
         let sx = self.scale / (rect.width() as f64 * 0.5);
         let sy = self.scale / (rect.height() as f64 * 0.5);
         let sz = 1.0 / depth_range;

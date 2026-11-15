@@ -1235,6 +1235,17 @@ impl App {
         if tool_button(ui, &self.icons.zoom_out, "Отдалить", false) {
             self.cam.zoom(rect, center, 0.8);
         }
+        let tip = if self.cam.perspective { "Перспектива включена" } else { "Перспектива выключена" };
+        ui.menu_button("Перспектива", |ui| {
+            ui.checkbox(&mut self.cam.perspective, "Включить перспективу").on_hover_text(tip);
+            ui.add_enabled_ui(self.cam.perspective, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Угол обзора");
+                    ui.add(egui::Slider::new(&mut self.cam.fov, 10.0..=100.0).suffix("°"));
+                });
+            });
+            ui.weak("Чем больше угол, тем сильнее перспектива.\nВ эскизе вид всегда параллельный.");
+        });
         if tool_button(ui, &self.icons.solid_view, "Показывать грани (тело)", !self.wireframe) {
             self.wireframe = false;
         }
@@ -1749,6 +1760,8 @@ impl App {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let rect = resp.rect;
         self.view_rect = rect;
+        self.cam.flat = self.sketch.is_some();
+        self.cam.min_dist = self.mesh.bounds.map_or(0.0, |(min, max)| (max - min).length() * 0.75);
         if self.need_fit {
             self.cam.fit(rect, self.mesh.bounds);
             self.need_fit = false;
