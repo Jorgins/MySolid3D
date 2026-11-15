@@ -722,6 +722,22 @@ impl Sketch {
     }
 }
 
+/// Склеивает фигуры попарно (дерево), чтобы каждая склейка работала с небольшими телами.
+fn fuse_all(mut shapes: Vec<Shape>) -> Option<Shape> {
+    while shapes.len() > 1 {
+        let mut next = Vec::with_capacity(shapes.len() / 2 + 1);
+        let mut it = shapes.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(a.union(&b).shape),
+                None => next.push(a),
+            }
+        }
+        shapes = next;
+    }
+    shapes.pop()
+}
+
 /// Элемент эскиза, к которому привязывается размер.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DimRef {
@@ -2087,14 +2103,14 @@ impl Part {
                     return Err("глубина должна быть больше нуля".into());
                 }
                 let sign = if *flip { -1.0 } else { 1.0 };
-                let mut result: Option<Shape> = None;
                 let id = self.features[index].id;
-                for prism in sketch.prisms(sketch.plane.normal() * *depth * sign, sketch.regions_of(id))? {
-                    result = Some(match result.as_ref().or(body) {
-                        Some(b) => b.union(&prism).shape,
-                        None => prism,
-                    });
-                }
+                // Призмы склеиваются между собой (они маленькие), а с деталью — одной операцией:
+                // булева операция над всей деталью на каждую призму отдельно очень дорога.
+                let tool = fuse_all(sketch.prisms(sketch.plane.normal() * *depth * sign, sketch.regions_of(id))?);
+                let result = tool.map(|t| match body {
+                    Some(b) => b.union(&t).shape,
+                    None => t,
+                });
                 Ok(result.map(|s| s.clean()))
             }
             FeatureKind::Cut { sketch, depth, through_all, flip } => {
@@ -2108,12 +2124,9 @@ impl Part {
                 }
                 // Вырез по умолчанию идёт вглубь материала — против нормали эскиза.
                 let sign = if *flip { 1.0 } else { -1.0 };
-                let mut result: Option<Shape> = None;
                 let id = self.features[index].id;
-                for prism in sketch.prisms(sketch.plane.normal() * depth * sign, sketch.regions_of(id))? {
-                    result = Some(result.as_ref().unwrap_or(body).subtract(&prism).shape);
-                }
-                Ok(result.map(|s| s.clean()))
+                let tool = fuse_all(sketch.prisms(sketch.plane.normal() * depth * sign, sketch.regions_of(id))?);
+                Ok(tool.map(|t| body.subtract(&t).shape.clean()))
             }
             FeatureKind::Fillet { edges, radius: size } | FeatureKind::Chamfer { edges, distance: size } => {
                 let chamfer = matches!(kind, FeatureKind::Chamfer { .. });
@@ -3142,6 +3155,30 @@ mod tests {
         s.set_dim(&from_left, 8.0).unwrap();
         assert_eq!(s.shapes[0], rect(8.0, 0.0, 42.0, 30.0));
         assert!((s.dim_value(&from_right).unwrap() - 50.0).abs() < 1e-9);
+    }
+
+    /// Замер времени построения по элементам файла (запуск вручную: cargo test time_file -- --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn time_file() {
+        let _kernel = kernel();
+        let path = std::env::var("MS3D_FILE").unwrap_or_else(|_| "samples/КрышкаRP2040.ms3d".into());
+        let mut part: Part = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let total = std::time::Instant::now();
+        let mut last = total.elapsed();
+        loop {
+            let (_, pending) = part.rebuild_step(None, 1);
+            let now = total.elapsed();
+            let i = pending.map_or(part.features.len(), |i| i);
+            if now - last > std::time::Duration::from_millis(30) {
+                println!("до элемента {i:>2}: {:>7.0} мс (очередной построен: {})", (now - last).as_secs_f64() * 1000.0, part.features.get(i.saturating_sub(1)).map_or("", |f| f.name.as_str()));
+            }
+            last = now;
+            if pending.is_none() {
+                break;
+            }
+        }
+        println!("итого {:.1} с", total.elapsed().as_secs_f64());
     }
 
     #[test]

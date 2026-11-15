@@ -398,6 +398,58 @@ fn parse_path(d: &str) -> Vec<Poly> {
     out
 }
 
+/// Допуск упрощения ломаных при импорте, мм: меньше толщины линии при печати, но выкидывает шум и лишние точки.
+const SIMPLIFY_TOLERANCE: f64 = 0.015;
+
+/// Расстояние от точки до отрезка.
+fn dist_to_segment(p: DVec2, a: DVec2, b: DVec2) -> f64 {
+    let d = b - a;
+    let len2 = d.length_squared();
+    let t = if len2 < 1e-18 { 0.0 } else { ((p - a).dot(d) / len2).clamp(0.0, 1.0) };
+    (a + d * t - p).length()
+}
+
+/// Упрощение открытой ломаной (Рамер — Дуглас — Пекер): концы остаются, отклонение не больше `eps`.
+fn simplify_open(pts: &[DVec2], eps: f64) -> Vec<DVec2> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let (a, b) = (pts[0], pts[pts.len() - 1]);
+    let (mut far, mut far_d) = (0, 0.0);
+    for (i, p) in pts.iter().enumerate().take(pts.len() - 1).skip(1) {
+        let d = dist_to_segment(*p, a, b);
+        if d > far_d {
+            (far, far_d) = (i, d);
+        }
+    }
+    if far_d <= eps {
+        return vec![a, b];
+    }
+    let mut left = simplify_open(&pts[..=far], eps);
+    left.pop();
+    left.extend(simplify_open(&pts[far..], eps));
+    left
+}
+
+/// Упрощение контура; у замкнутого он делится на две цепочки по самой далёкой от первой точке.
+fn simplify(pts: Vec<DVec2>, closed: bool, eps: f64) -> Vec<DVec2> {
+    if !closed {
+        return simplify_open(&pts, eps);
+    }
+    if pts.len() < 5 {
+        return pts;
+    }
+    let far = (1..pts.len()).max_by(|&i, &j| (pts[i] - pts[0]).length().total_cmp(&(pts[j] - pts[0]).length())).unwrap_or(1);
+    let mut first = simplify_open(&pts[..=far], eps);
+    first.pop();
+    let mut second: Vec<DVec2> = pts[far..].to_vec();
+    second.push(pts[0]);
+    let mut second = simplify_open(&second, eps);
+    second.pop();
+    first.extend(second);
+    first
+}
+
 /// Ломаная в фигуру эскиза (после преобразования в миллиметры): без совпадающих подряд точек.
 fn poly_shape(poly: &Poly, m: &Mat) -> Option<SketchShape> {
     let mut pts: Vec<DVec2> = Vec::with_capacity(poly.pts.len());
@@ -412,6 +464,7 @@ fn poly_shape(poly: &Poly, m: &Mat) -> Option<SketchShape> {
         pts.pop();
         closed = true;
     }
+    let pts = simplify(pts, closed, SIMPLIFY_TOLERANCE);
     if pts.len() < 2 || (closed && pts.len() < 3) {
         return None;
     }
@@ -674,6 +727,24 @@ mod tests {
         assert!(close(w, 10.0) && close(h, 10.0));
         // Повёрнутый квадрат — уже контур из четырёх точек.
         assert!(matches!(&shapes[1], SketchShape::Path { points, closed: true } if points.len() == 4));
+    }
+
+    #[test]
+    fn noisy_outline_is_simplified() {
+        // Окружность из тысячи точек с мелким шумом упрощается до нескольких десятков, форма не меняется.
+        let n = 1000;
+        let pts: Vec<String> = (0..n)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / n as f64;
+                let noise = if i % 2 == 0 { 0.002 } else { -0.002 };
+                format!("{:.4},{:.4}", (5.0 + noise) * t.cos() + 10.0, (5.0 + noise) * t.sin() + 10.0)
+            })
+            .collect();
+        let svg = format!(r#"<svg width="20mm" height="20mm" viewBox="0 0 20 20"><polygon points="{}"/></svg>"#, pts.join(" "));
+        let SketchShape::Path { points, closed: true } = &parse(&svg).unwrap()[0] else { panic!() };
+        assert!(points.len() < 120, "{} точек", points.len());
+        let r = points.iter().map(|p| p.pos().length()).fold(0.0f64, f64::max);
+        assert!((r - 5.0).abs() < 0.03, "радиус {r}");
     }
 
     #[test]
