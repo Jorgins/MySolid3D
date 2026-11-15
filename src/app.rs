@@ -349,8 +349,26 @@ fn placing_mode(a: DVec2, b: DVec2, p: DVec2) -> DimMode {
 }
 
 /// Поле ввода длины в миллиметрах.
+/// Число из текста поля: запятая как десятичный разделитель, пробелы, «мм» и «°» в конце не мешают.
+fn parse_number(text: &str) -> Option<f64> {
+    let clean: String = text
+        .trim()
+        .trim_end_matches(|c: char| c.is_alphabetic() || c == '°' || c.is_whitespace())
+        .replace(',', ".")
+        .replace('−', "-")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    clean.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// Перетаскиваемое числовое поле, понимающее запятую вместо точки.
+fn drag_value<N: egui::emath::Numeric>(v: &mut N) -> egui::DragValue<'_> {
+    egui::DragValue::new(v).custom_parser(parse_number)
+}
+
 fn mm(v: &mut f64) -> egui::DragValue<'_> {
-    egui::DragValue::new(v).speed(0.25).max_decimals(1).suffix(" мм")
+    drag_value(v).speed(0.25).max_decimals(1).suffix(" мм")
 }
 
 /// Операции над выбранной фигурой эскиза (открывают окно с параметрами).
@@ -1296,7 +1314,7 @@ impl App {
         ui.checkbox(&mut self.snap, "Привязка к сетке");
         ui.checkbox(&mut self.snap_objects, "Привязка к объектам")
             .on_hover_text("К точкам и линиям этого и более ранних эскизов, к рёбрам и вершинам тела");
-        ui.add(egui::DragValue::new(&mut self.grid_step).speed(0.1).range(0.1..=100.0).suffix(" мм"))
+        ui.add(drag_value(&mut self.grid_step).speed(0.1).range(0.1..=100.0).suffix(" мм"))
             .on_hover_text("Шаг сетки");
         if add_image {
             self.add_image();
@@ -1516,14 +1534,14 @@ impl App {
                     OpKind::Rotate => {
                         ui.horizontal(|ui| {
                             ui.label("Угол");
-                            ui.add(egui::DragValue::new(&mut p.angle).speed(1.0).max_decimals(1).suffix("°"));
+                            ui.add(drag_value(&mut p.angle).speed(1.0).max_decimals(1).suffix("°"));
                         });
                         pivot_choice(ui, p);
                     }
                     OpKind::Scale => {
                         ui.horizontal(|ui| {
                             ui.label("Коэффициент");
-                            ui.add(egui::DragValue::new(&mut p.factor).speed(0.02).range(0.01..=100.0));
+                            ui.add(drag_value(&mut p.factor).speed(0.02).range(0.01..=100.0));
                         });
                         pivot_choice(ui, p);
                     }
@@ -1566,16 +1584,16 @@ impl App {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Точка №");
-                            ui.add(egui::DragValue::new(&mut p.vertex).range(0..=1000));
+                            ui.add(drag_value(&mut p.vertex).range(0..=1000));
                         });
                         ui.weak("0 — все углы контура; номера точек видны в свойствах эскиза.");
                     }
                     OpKind::PatternGrid => {
                         ui.horizontal(|ui| {
                             ui.label("Столбцов");
-                            ui.add(egui::DragValue::new(&mut p.cols).range(1..=100));
+                            ui.add(drag_value(&mut p.cols).range(1..=100));
                             ui.label("Рядов");
-                            ui.add(egui::DragValue::new(&mut p.rows).range(1..=100));
+                            ui.add(drag_value(&mut p.rows).range(1..=100));
                         });
                         ui.horizontal(|ui| {
                             ui.label("Шаг X");
@@ -1587,11 +1605,11 @@ impl App {
                     OpKind::PatternCircle => {
                         ui.horizontal(|ui| {
                             ui.label("Фигур всего");
-                            ui.add(egui::DragValue::new(&mut p.count).range(2..=1000));
+                            ui.add(drag_value(&mut p.count).range(2..=1000));
                         });
                         ui.horizontal(|ui| {
                             ui.label("Сектор");
-                            ui.add(egui::DragValue::new(&mut p.sweep).speed(1.0).range(1.0..=360.0).suffix("°"));
+                            ui.add(drag_value(&mut p.sweep).speed(1.0).range(1.0..=360.0).suffix("°"));
                         });
                         pivot_choice(ui, p);
                     }
@@ -1847,7 +1865,7 @@ impl App {
                 ui.label("Глубина");
                 ui.add_enabled(
                     enabled,
-                    egui::DragValue::new(depth).speed(0.25).range(MIN_SIZE..=1.0e4).max_decimals(1).suffix(" мм"),
+                    drag_value(depth).speed(0.25).range(MIN_SIZE..=1.0e4).max_decimals(1).suffix(" мм"),
                 )
                 .changed()
             })
@@ -1871,7 +1889,7 @@ impl App {
                     egui::Grid::new("sketch_image").num_columns(2).show(ui, |ui| {
                         let row = |ui: &mut egui::Ui, label: &str, v: &mut f64, min: f64| {
                             ui.label(label);
-                            let drag = egui::DragValue::new(v).speed(0.5).range(min..=1.0e5).max_decimals(1).suffix(" мм");
+                            let drag = drag_value(v).speed(0.5).range(min..=1.0e5).max_decimals(1).suffix(" мм");
                             ui.add(drag);
                             ui.end_row();
                         };
@@ -1907,7 +1925,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Размер");
                     let drag =
-                        egui::DragValue::new(size).speed(0.1).range(MIN_SIZE..=1.0e3).max_decimals(1).suffix(" мм");
+                        drag_value(size).speed(0.1).range(MIN_SIZE..=1.0e3).max_decimals(1).suffix(" мм");
                     changed |= ui.add(drag).changed();
                 });
                 ui.weak(format!("Рёбер: {}", edges.len()));
@@ -2075,6 +2093,16 @@ impl App {
         self.draw_images(&painter, rect);
         self.draw_regions(&painter, rect);
         self.draw_edge_highlights(&painter, rect);
+        // Ребро под курсором: его длина рядом с курсором.
+        if let (Some(i), Some(pos)) = (self.hover_edge, resp.hover_pos()) {
+            if let Some(edge) = self.mesh.edges.get(i) {
+                let len: f64 = edge.points.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+                let galley = painter.layout_no_wrap(format!("Длина {} мм", fmt_mm(len)), FontId::proportional(13.0), Color32::WHITE);
+                let at = pos + Vec2::new(14.0, 14.0);
+                painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(4.0), 4.0, Color32::from_black_alpha(190));
+                painter.galley(at, galley, Color32::WHITE);
+            }
+        }
         self.draw_errors(&painter, rect);
         self.draw_base_planes(&painter, rect);
         self.draw_sketches(&painter, rect);
@@ -3391,8 +3419,8 @@ impl App {
                     }
                 }
                 if !text.is_empty() {
-                    result = Some(match text.parse::<f64>() {
-                        Ok(v) if v.is_finite() => sketch.set_dim(&dim, (v * 10.0).round() / 10.0),
+                    result = Some(match parse_number(&text) {
+                        Some(v) => sketch.set_dim(&dim, (v * 10.0).round() / 10.0),
                         _ => Err("введите число".into()),
                     });
                 }
@@ -3440,7 +3468,7 @@ fn shapes_ui(ui: &mut egui::Ui, sketch: &mut Sketch, selected: Option<usize>) ->
             egui::Grid::new(("shape", i)).num_columns(2).show(ui, |ui| {
                 let mut row = |ui: &mut egui::Ui, label: &str, v: &mut f64, min: f64| {
                     ui.label(label);
-                    let drag = egui::DragValue::new(v).speed(0.25).range(min..=1.0e5).max_decimals(1).suffix(" мм");
+                    let drag = drag_value(v).speed(0.25).range(min..=1.0e5).max_decimals(1).suffix(" мм");
                     changed |= ui.add(drag).changed();
                     ui.end_row();
                 };
@@ -3728,5 +3756,21 @@ impl eframe::App for App {
         }
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         self.frame_ms = if self.frame_ms == 0.0 { ms } else { self.frame_ms * 0.9 + ms * 0.1 };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_number;
+
+    #[test]
+    fn numbers_with_comma_and_units() {
+        assert_eq!(parse_number("12,5"), Some(12.5));
+        assert_eq!(parse_number(" 12.5 мм"), Some(12.5));
+        assert_eq!(parse_number("−3,25"), Some(-3.25));
+        assert_eq!(parse_number("45°"), Some(45.0));
+        assert_eq!(parse_number("1 200,5"), Some(1200.5));
+        assert_eq!(parse_number("abc"), None);
+        assert_eq!(parse_number(""), None);
     }
 }
