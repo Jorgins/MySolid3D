@@ -582,6 +582,9 @@ pub struct Sketch {
     /// Где стоит размерная линия (подпись) у поставленных размеров, как их разместил пользователь.
     #[serde(default)]
     pub dim_places: Vec<(Dim, DVec2)>,
+    /// Какие области (номера фигур) вытягивает каждая операция (номер элемента); нет записи — области по умолчанию.
+    #[serde(default)]
+    pub region_sel: Vec<(u64, Vec<usize>)>,
 }
 
 /// Картинка-подложка эскиза. В файле детали хранится только путь к ней.
@@ -597,32 +600,86 @@ pub struct SketchImage {
 }
 
 impl Sketch {
-    /// Тела-призмы из контуров эскиза; вложенные контуры становятся отверстиями.
-    fn prisms(&self, dir: DVec3) -> Result<Vec<Shape>, String> {
+    /// Замкнутые фигуры, из которых можно выбирать области вытягивания (линии построения не в счёт).
+    pub fn region_candidates(&self) -> Vec<usize> {
+        (0..self.shapes.len()).filter(|&i| !self.shapes[i].is_construction() && self.shapes[i].is_closed()).collect()
+    }
+
+    /// Области по умолчанию: внешние контуры и «острова» внутри отверстий (чётная вложенность).
+    pub fn default_regions(&self) -> Vec<usize> {
+        let list = self.region_candidates();
+        list.iter()
+            .copied()
+            .filter(|&i| list.iter().filter(|&&j| j != i && self.shapes[j].contains(&self.shapes[i])).count() % 2 == 0)
+            .collect()
+    }
+
+    /// Области, выбранные для операции; `None` — по умолчанию.
+    pub fn regions_of(&self, feature: u64) -> Option<&[usize]> {
+        self.region_sel.iter().find(|(f, _)| *f == feature).map(|(_, l)| l.as_slice())
+    }
+
+    /// Области, которые вытянет операция: выбранные или по умолчанию.
+    pub fn active_regions(&self, feature: u64) -> Vec<usize> {
+        self.regions_of(feature).map(<[usize]>::to_vec).unwrap_or_else(|| self.default_regions())
+    }
+
+    /// Включает или выключает область `shape` в операции `feature`.
+    pub fn toggle_region(&mut self, feature: u64, shape: usize) {
+        let mut list = self.active_regions(feature);
+        match list.iter().position(|&i| i == shape) {
+            Some(at) => drop(list.remove(at)),
+            None => list.push(shape),
+        }
+        list.sort_unstable();
+        self.region_sel.retain(|(f, _)| *f != feature);
+        if list != self.default_regions() {
+            self.region_sel.push((feature, list));
+        }
+    }
+
+    /// Возвращает операции области по умолчанию.
+    pub fn reset_regions(&mut self, feature: u64) {
+        self.region_sel.retain(|(f, _)| *f != feature);
+    }
+
+    /// Тела-призмы из выбранных областей эскиза: область — фигура без вложенных в неё фигур (они — отверстия).
+    /// `regions` — номера фигур; `None` — по умолчанию.
+    fn prisms(&self, dir: DVec3, regions: Option<&[usize]>) -> Result<Vec<Shape>, String> {
         // Линии построения в тело не входят.
-        let shapes: Vec<&SketchShape> = self.shapes.iter().filter(|s| !s.is_construction()).collect();
-        if shapes.is_empty() {
+        let list: Vec<(usize, &SketchShape)> =
+            self.shapes.iter().enumerate().filter(|(_, s)| !s.is_construction()).collect();
+        if list.is_empty() {
             return Err("эскиз пуст".into());
         }
-        if shapes.iter().any(|s| !s.is_closed()) {
+        if list.iter().any(|(_, s)| !s.is_closed()) {
             return Err("в эскизе есть незамкнутый контур — завершите его щелчком по первой точке".into());
         }
-        let n = shapes.len();
+        let n = list.len();
         let depth: Vec<usize> = (0..n)
-            .map(|i| (0..n).filter(|&j| j != i && shapes[j].contains(shapes[i])).count())
+            .map(|i| (0..n).filter(|&j| j != i && list[j].1.contains(list[i].1)).count())
             .collect();
+        let chosen: Vec<usize> = (0..n)
+            .filter(|&i| match regions {
+                None => depth[i] % 2 == 0,
+                Some(r) => r.contains(&list[i].0),
+            })
+            .collect();
+        if chosen.is_empty() {
+            return Err("не выбрано ни одной области эскиза".into());
+        }
         let dir_unit = dir.normalize();
         // Отверстия вытягиваем с запасом в обе стороны, чтобы булева операция была устойчивой.
         let hole_plane = self.plane.shifted(-dir_unit.dot(self.plane.normal()));
         let hole_dir = dir + dir_unit * 2.0;
 
         let mut out = Vec::new();
-        for i in (0..n).filter(|&i| depth[i] % 2 == 0) {
-            let face = Face::from_wire(&shapes[i].wire(&self.plane)?);
+        for i in chosen {
+            let face = Face::from_wire(&list[i].1.wire(&self.plane)?);
             let mut solid: Shape = face.extrude(dir).into();
             for k in 0..n {
-                if depth[k] == depth[i] + 1 && shapes[i].contains(shapes[k]) {
-                    let hole_face = Face::from_wire(&shapes[k].wire(&hole_plane)?);
+                if depth[k] == depth[i] + 1 && list[i].1.contains(list[k].1) {
+                    let hole_face = Face::from_wire(&list[k].1.wire(&hole_plane)?);
                     let hole: Shape = hole_face.extrude(hole_dir).into();
                     solid = solid.subtract(&hole).shape;
                 }
@@ -784,7 +841,7 @@ fn shift_chain(
 
 impl Sketch {
     pub fn new(plane: Plane, shapes: Vec<SketchShape>) -> Self {
-        Self { plane, shapes, dims: Vec::new(), image: None, dim_places: Vec::new() }
+        Self { plane, shapes, dims: Vec::new(), image: None, dim_places: Vec::new(), region_sel: Vec::new() }
     }
 
     /// Удаляет фигуру вместе с её размерами; размеры остальных фигур остаются на своих местах.
@@ -793,6 +850,11 @@ impl Sketch {
             return;
         }
         self.shapes.remove(index);
+        // Выбранные области остаются теми же, хотя номера фигур сдвинулись.
+        for (_, list) in &mut self.region_sel {
+            list.retain(|&i| i != index);
+            list.iter_mut().for_each(|i| *i -= usize::from(*i > index));
+        }
         let shift = |s: usize| (s != index).then(|| if s > index { s - 1 } else { s });
         let fix = |r: DimRef| match r {
             DimRef::Origin => Some(r),
@@ -1688,7 +1750,7 @@ impl Part {
         let sketch = feature.sketch_ref().and_then(|id| {
             self.features[..index].iter().find_map(|f| match &f.kind {
                 // Размеры эскиза на тело не влияют.
-                FeatureKind::Sketch(s) if f.id == id => serde_json::to_string(&(&s.plane, &s.shapes)).ok(),
+                FeatureKind::Sketch(s) if f.id == id => serde_json::to_string(&(&s.plane, &s.shapes, s.regions_of(feature.id))).ok(),
                 _ => None,
             })
         });
@@ -1791,7 +1853,8 @@ impl Part {
                 }
                 let sign = if *flip { -1.0 } else { 1.0 };
                 let mut result: Option<Shape> = None;
-                for prism in sketch.prisms(sketch.plane.normal() * *depth * sign)? {
+                let id = self.features[index].id;
+                for prism in sketch.prisms(sketch.plane.normal() * *depth * sign, sketch.regions_of(id))? {
                     result = Some(match result.as_ref().or(body) {
                         Some(b) => b.union(&prism).shape,
                         None => prism,
@@ -1811,7 +1874,8 @@ impl Part {
                 // Вырез по умолчанию идёт вглубь материала — против нормали эскиза.
                 let sign = if *flip { 1.0 } else { -1.0 };
                 let mut result: Option<Shape> = None;
-                for prism in sketch.prisms(sketch.plane.normal() * depth * sign)? {
+                let id = self.features[index].id;
+                for prism in sketch.prisms(sketch.plane.normal() * depth * sign, sketch.regions_of(id))? {
                     result = Some(result.as_ref().unwrap_or(body).subtract(&prism).shape);
                 }
                 Ok(result.map(|s| s.clean()))
@@ -2681,6 +2745,58 @@ mod tests {
         assert!(s.shapes[0].points()[1].x.abs() < 1e-9);
         s.apply_relation(DimRef::Origin, b, Relation::Coincident).unwrap();
         assert!(s.shapes[0].points()[1].length() < 1e-9);
+    }
+
+    #[test]
+    fn choose_extrude_regions() {
+        let _kernel = kernel();
+        // Два отдельных прямоугольника и окружность внутри первого.
+        let shapes = vec![
+            rect(0.0, 0.0, 40.0, 30.0),
+            rect(60.0, 0.0, 20.0, 20.0),
+            SketchShape::Circle { cx: 20.0, cy: 15.0, r: 5.0 },
+        ];
+        let mut part = Part::default();
+        let sk = part.add("Эскиз", FeatureKind::Sketch(Sketch::new(Plane::TOP, shapes)));
+        let boss = part.add("Бобышка", FeatureKind::Boss { sketch: sk, depth: 10.0, flip: false });
+        let volume = |part: &mut Part| {
+            let body = part.rebuild(None).expect("тело");
+            let mesh = RenderMesh::from_shape(&body);
+            let (lo, hi) = mesh.bounds.unwrap();
+            (hi - lo, part.features.iter().find_map(|f| f.error.clone()))
+        };
+        // По умолчанию: оба прямоугольника, окружность — отверстие.
+        assert_eq!(part.sketch(sk).unwrap().active_regions(boss), vec![0, 1]);
+        let (size, error) = volume(&mut part);
+        assert!(error.is_none() && (size.x - 80.0).abs() < 1e-6, "{size:?} {error:?}");
+        // Только второй прямоугольник.
+        let s = part.sketch_mut(sk).unwrap();
+        s.toggle_region(boss, 0);
+        assert_eq!(s.regions_of(boss), Some(&[1usize][..]));
+        let (size, _) = volume(&mut part);
+        assert!((size.x - 20.0).abs() < 1e-6, "{size:?}");
+        // Остров: окружность сама по себе.
+        let s = part.sketch_mut(sk).unwrap();
+        s.toggle_region(boss, 1);
+        s.toggle_region(boss, 2);
+        let (size, _) = volume(&mut part);
+        assert!((size.x - 10.0).abs() < 1e-6, "{size:?}");
+        // Удаление фигуры сдвигает номера выбранных областей.
+        let s = part.sketch_mut(sk).unwrap();
+        s.remove_shape(0);
+        assert_eq!(s.regions_of(boss), Some(&[1usize][..]));
+        // Возврат к областям по умолчанию.
+        s.reset_regions(boss);
+        assert!(s.regions_of(boss).is_none());
+        // Пустой выбор — ошибка построения, а не паника.
+        s.toggle_region(boss, 0);
+        s.toggle_region(boss, 1);
+        let s = part.sketch_mut(sk).unwrap();
+        if s.default_regions().len() == 2 {
+            s.toggle_region(boss, 0);
+            s.toggle_region(boss, 1);
+        }
+        let _ = part.rebuild(None);
     }
 
     #[test]

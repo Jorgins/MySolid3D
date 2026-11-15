@@ -57,6 +57,44 @@ enum Tool {
     Dimension,
 }
 
+/// Короткое описание фигуры для списка областей.
+fn region_label(shape: &SketchShape) -> String {
+    match shape {
+        SketchShape::Rect { w, h, .. } => format!("Прямоугольник {} × {}", fmt_mm(*w), fmt_mm(*h)),
+        SketchShape::Circle { r, .. } => format!("Окружность Ø{}", fmt_mm(r * 2.0)),
+        SketchShape::Path { points, .. } => format!("Контур из {} точек", points.len()),
+    }
+}
+
+/// Список областей эскиза с галочками: какие из них вытягивает операция.
+fn regions_ui(
+    ui: &mut egui::Ui,
+    rows: &[(usize, String, bool)],
+    toggle: &mut Option<usize>,
+    reset: &mut bool,
+    hover: &mut Option<usize>,
+) {
+    if rows.len() < 2 {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.strong("Области эскиза");
+    for (shape, label, on) in rows {
+        let mut value = *on;
+        let resp = ui.checkbox(&mut value, label.as_str());
+        if resp.changed() {
+            *toggle = Some(*shape);
+        }
+        if resp.hovered() {
+            *hover = Some(*shape);
+        }
+    }
+    ui.weak("Вложенная фигура внутри выбранной — отверстие.");
+    if ui.small_button("Области по умолчанию").clicked() {
+        *reset = true;
+    }
+}
+
 /// Элемент `r` ещё существует в эскизе (фигуру или точку могли удалить).
 fn sketch_ref_exists(sketch: &Sketch, r: DimRef) -> bool {
     match r {
@@ -533,6 +571,8 @@ pub struct App {
     view_rect: Rect,
     /// Загруженная картинка-подложка: (путь, текстура и отношение высоты к ширине).
     image_tex: std::collections::HashMap<String, Option<(egui::TextureHandle, f32)>>,
+    /// Область (номер фигуры), на строку которой наведён курсор в свойствах вытягивания: подсвечивается на виде.
+    region_hover: Option<usize>,
     /// История для отмены и повтора: состояния детали до каждого изменения.
     undo: Vec<Part>,
     redo: Vec<Part>,
@@ -651,6 +691,7 @@ impl App {
             render_mode: RenderMode::Solid,
             view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0)),
             image_tex: Default::default(),
+            region_hover: None,
             undo: Vec::new(),
             redo: Vec::new(),
             base: Part::default(),
@@ -883,6 +924,9 @@ impl App {
         };
         self.selection = Selection::Feature(id);
         self.status.clear();
+        if self.part.sketch(sketch).is_some_and(|s| s.region_candidates().len() > 1) {
+            self.status = "В эскизе несколько областей — выберите нужные галочками в свойствах".into();
+        }
         self.dirty = true;
     }
 
@@ -1366,6 +1410,27 @@ impl App {
         painter.add(egui::Shape::mesh(mesh));
     }
 
+    /// Пока выбрана бобышка или вырез, контуры его эскиза показаны: вытягиваемые области ярко, остальные бледно.
+    fn draw_regions(&self, painter: &Painter, rect: Rect) {
+        let Selection::Feature(id) = self.selection else { return };
+        let Some(FeatureKind::Boss { sketch, .. } | FeatureKind::Cut { sketch, .. }) = self.part.feature(id).map(|f| &f.kind)
+        else {
+            return;
+        };
+        let Some(sk) = self.part.sketch(*sketch) else { return };
+        let active = sk.active_regions(id);
+        for i in sk.region_candidates() {
+            let stroke = if self.region_hover == Some(i) {
+                Stroke::new(4.0, Color32::WHITE)
+            } else if active.contains(&i) {
+                Stroke::new(2.5, SELECT_COLOR)
+            } else {
+                Stroke::new(1.5, Color32::from_gray(120))
+            };
+            draw_shape(painter, &self.cam, rect, &sk.plane, &sk.shapes[i], stroke);
+        }
+    }
+
     /// Картинки эскизов на 3D-виде (редактируемый эскиз рисует сам режим эскиза).
     fn draw_images(&mut self, painter: &Painter, rect: Rect) {
         let editing = self.sketch.as_ref().map(|e| e.id);
@@ -1702,6 +1767,23 @@ impl App {
     fn feature_properties(&mut self, ui: &mut egui::Ui, id: u64) {
         let editing = self.sketch.as_ref().map(|e| e.id);
         let selected_shape = self.sketch.as_ref().and_then(|e| e.selected);
+        // Области эскиза для вытягивания: (номер фигуры, подпись, включена) — выбор меняется после этого окна.
+        let regions: Option<(u64, Vec<(usize, String, bool)>)> = match self.part.feature(id).map(|f| &f.kind) {
+            Some(FeatureKind::Boss { sketch, .. } | FeatureKind::Cut { sketch, .. }) => {
+                self.part.sketch(*sketch).map(|sk| {
+                    let active = sk.active_regions(id);
+                    let rows = sk
+                        .region_candidates()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, i)| (i, format!("{}. {}", k + 1, region_label(&sk.shapes[i])), active.contains(&i)))
+                        .collect();
+                    (*sketch, rows)
+                })
+            }
+            _ => None,
+        };
+        let (mut region_toggle, mut region_reset, mut region_hover) = (None, false, None);
         let Some(feature) = self.part.feature_mut(id) else {
             self.selection = Selection::None;
             return;
@@ -1766,11 +1848,17 @@ impl App {
             FeatureKind::Boss { depth, flip, .. } => {
                 changed |= depth_row(ui, depth, true);
                 changed |= ui.checkbox(flip, "Обратное направление").changed();
+                if let Some((_, rows)) = &regions {
+                    regions_ui(ui, rows, &mut region_toggle, &mut region_reset, &mut region_hover);
+                }
             }
             FeatureKind::Cut { depth, through_all, flip, .. } => {
                 changed |= ui.checkbox(through_all, "Насквозь").changed();
                 changed |= depth_row(ui, depth, !*through_all);
                 changed |= ui.checkbox(flip, "Обратное направление").changed();
+                if let Some((_, rows)) = &regions {
+                    regions_ui(ui, rows, &mut region_toggle, &mut region_reset, &mut region_hover);
+                }
             }
             FeatureKind::Fillet { edges, radius: size } | FeatureKind::Chamfer { edges, distance: size } => {
                 ui.horizontal(|ui| {
@@ -1793,6 +1881,20 @@ impl App {
         if editing.is_none() {
             ui.separator();
             delete = ui.button("Удалить элемент").clicked();
+        }
+        self.region_hover = region_hover;
+        if let Some((sketch, _)) = &regions {
+            if let Some(sk) = self.part.sketch_mut(*sketch) {
+                if let Some(shape) = region_toggle {
+                    sk.toggle_region(id, shape);
+                }
+                if region_reset {
+                    sk.reset_regions(id);
+                }
+            }
+            if region_toggle.is_some() || region_reset {
+                self.dirty = true;
+            }
         }
 
         if removed_shape {
@@ -1928,6 +2030,7 @@ impl App {
         });
 
         self.draw_images(&painter, rect);
+        self.draw_regions(&painter, rect);
         self.draw_edge_highlights(&painter, rect);
         self.draw_errors(&painter, rect);
         self.draw_base_planes(&painter, rect);
