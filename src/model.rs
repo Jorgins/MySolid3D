@@ -895,6 +895,28 @@ impl Sketch {
             .collect();
     }
 
+    /// Скругляет или срезает только указанные углы фигуры `index`. Если хоть один угол не получается,
+    /// фигура остаётся как была, а ошибка говорит почему.
+    pub fn round_corner_set(&mut self, index: usize, vertices: &[usize], size: f64, chamfer: bool) -> Result<usize, String> {
+        let backup = (self.shapes.get(index).ok_or("фигура не найдена")?.clone(), self.dims.clone());
+        // С большего номера: вставка новой точки сдвигает только следующие за ней номера.
+        let mut order: Vec<usize> = vertices.to_vec();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        order.dedup();
+        let mut done = 0;
+        for v in order {
+            match self.round_corners(index, Some(v), size, chamfer) {
+                Ok(n) => done += n,
+                Err(e) => {
+                    self.shapes[index] = backup.0;
+                    self.dims = backup.1;
+                    return Err(format!("точка {}: {e}", v + 1));
+                }
+            }
+        }
+        Ok(done)
+    }
+
     /// Скругляет или срезает углы фигуры `index` (см. `SketchShape::round_corners`).
     pub fn round_corners(
         &mut self,
@@ -3000,6 +3022,21 @@ mod tests {
         // Совпадение с внешней точкой: своя фигура встаёт на неё.
         sk.align(Pick::Ref(corner.unwrap()), Pick::Ref(near), Relation::Coincident).unwrap();
         assert!((sk.shapes[0].points()[0] - DVec2::new(40.0, 30.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn round_only_chosen_corners() {
+        let mut s = Sketch::new(Plane::TOP, vec![rect(0.0, 0.0, 40.0, 30.0)]);
+        // Два угла из четырёх: остальные остаются острыми.
+        assert_eq!(s.round_corner_set(0, &[0, 2], 5.0, false), Ok(2));
+        let SketchShape::Path { points, closed: true } = &s.shapes[0] else { panic!() };
+        assert_eq!(points.len(), 6);
+        assert_eq!(points.iter().filter(|p| p.bulge != 0.0).count(), 2);
+        // Невозможный угол: фигура не меняется целиком.
+        let mut t = Sketch::new(Plane::TOP, vec![rect(0.0, 0.0, 4.0, 4.0)]);
+        let before = t.shapes[0].clone();
+        assert!(t.round_corner_set(0, &[0, 1], 3.0, false).is_err());
+        assert_eq!(t.shapes[0], before);
     }
 
     #[test]

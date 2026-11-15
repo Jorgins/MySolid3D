@@ -146,6 +146,8 @@ struct SketchEdit {
     /// Группа выбранных фигур (после импорта SVG, Ctrl+A, Shift+щелчок): двигаются и масштабируются вместе.
     multi: Vec<usize>,
     group_drag: Option<GroupDrag>,
+    /// Вершины выбранной фигуры, отмеченные для скругления или фаски угла.
+    corners: Vec<usize>,
     /// Точки (и начало координат), выбранные стрелкой для связи: до двух.
     points_sel: Vec<Pick>,
     /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
@@ -174,6 +176,7 @@ impl SketchEdit {
             image_drag: None,
             multi: Vec::new(),
             group_drag: None,
+            corners: Vec::new(),
             points_sel: Vec::new(),
             line_menu: None,
             op: None,
@@ -413,7 +416,8 @@ struct OpParams {
     dy: f64,
     dist: f64,
     size: f64,
-    vertex: usize,
+    /// Номера вершин выбранной фигуры, отмеченных для скругления или фаски.
+    corners: Vec<usize>,
     cols: usize,
     rows: usize,
     count: usize,
@@ -432,7 +436,7 @@ impl Default for OpParams {
             dy: 10.0,
             dist: 2.0,
             size: 2.0,
-            vertex: 0,
+            corners: Vec::new(),
             cols: 3,
             rows: 1,
             count: 6,
@@ -486,8 +490,10 @@ fn apply_op(part: &mut Part, id: u64, index: usize, kind: OpKind, p: &OpParams) 
             done(added(sketch))
         }
         OpKind::CornerFillet | OpKind::CornerChamfer => {
-            let vertex = p.vertex.checked_sub(1);
-            let n = sketch.round_corners(index, vertex, p.size, kind == OpKind::CornerChamfer)?;
+            if p.corners.is_empty() {
+                return Err("Отметьте щелчком вершины фигуры, которые нужно обработать".into());
+            }
+            let n = sketch.round_corner_set(index, &p.corners, p.size, kind == OpKind::CornerChamfer)?;
             Ok((None, format!("Обработано углов: {n}")))
         }
         OpKind::PatternGrid => {
@@ -1275,6 +1281,11 @@ impl App {
                         self.status = "Сначала выберите фигуру инструментом «Выбор»".into();
                     } else {
                         edit.op = if edit.op == Some($kind) { None } else { Some($kind) };
+                        // Углы отмечаются щелчком стрелкой по вершинам.
+                        if matches!(edit.op, Some(OpKind::CornerFillet | OpKind::CornerChamfer)) {
+                            edit.tool = Tool::Select;
+                            edit.corners.clear();
+                        }
                     }
                 }
             };
@@ -1519,6 +1530,7 @@ impl App {
             edit.op = None;
             return;
         };
+        let corner_total = self.part.sketch(id).and_then(|s| s.shapes.get(index)).map_or(0, |s| s.points().len());
         let (mut apply, mut close) = (false, false);
         egui::Window::new(kind.title())
             .collapsible(false)
@@ -1582,11 +1594,16 @@ impl App {
                             ui.label(if kind == OpKind::CornerFillet { "Радиус" } else { "Размер фаски" });
                             ui.add(mm(&mut p.size).range(MIN_SIZE..=1.0e4));
                         });
+                        ui.label(format!("Отмечено вершин: {}", edit.corners.len()));
                         ui.horizontal(|ui| {
-                            ui.label("Точка №");
-                            ui.add(drag_value(&mut p.vertex).range(0..=1000));
+                            if ui.small_button("Все").on_hover_text("Отметить все вершины фигуры").clicked() {
+                                edit.corners = (0..corner_total).collect();
+                            }
+                            if ui.small_button("Снять").clicked() {
+                                edit.corners.clear();
+                            }
                         });
-                        ui.weak("0 — все углы контура; номера точек видны в свойствах эскиза.");
+                        ui.weak("Щёлкните по вершинам фигуры на виде — обработаются только отмеченные.");
                     }
                     OpKind::PatternGrid => {
                         ui.horizontal(|ui| {
@@ -1623,9 +1640,12 @@ impl App {
             edit.op = None;
         }
         if apply {
-            let params = edit.params.clone();
+            let mut params = edit.params.clone();
+            params.corners = edit.corners.clone();
             match apply_op(&mut self.part, id, index, kind, &params) {
                 Ok((select, message)) => {
+                    // Номера вершин после скругления сдвинулись.
+                    edit.corners.clear();
                     if let Some(i) = select {
                         edit.selected = Some(i);
                     }
@@ -2837,6 +2857,22 @@ impl App {
                         }
                     }
                 }
+                // Скругление или фаска угла: щелчок по вершине выбранной фигуры отмечает её (или снимает отметку).
+                let corner_mode = matches!(edit.op, Some(OpKind::CornerFillet | OpKind::CornerChamfer));
+                let mut corner_click = false;
+                if corner_mode && clicked && !dragging_vertex {
+                    let hit = edit.selected.zip(pointer.and_then(raw_at)).and_then(|(si, p)| {
+                        sketch.shapes.get(si)?.points().iter().position(|q| (*q - p).length() < 9.0 * px)
+                    });
+                    if let Some(vi) = hit {
+                        match edit.corners.iter().position(|&c| c == vi) {
+                            Some(at) => drop(edit.corners.remove(at)),
+                            None => edit.corners.push(vi),
+                        }
+                        corner_click = true;
+                    }
+                }
+                let clicked = clicked && !corner_click;
                 // Щелчок по точке контура или по началу координат отмечает её для связи (до двух точек).
                 if clicked && !dragging_vertex {
                     let hit = pointer.and_then(raw_at).and_then(|p| sketch.pick_point(p, 8.0 * px));
@@ -3061,6 +3097,21 @@ impl App {
                 for &i in &edit.multi {
                     if let Some(shape) = sketch.shapes.get(i) {
                         draw_shape(painter, &cam, rect, &plane, shape, Stroke::new(2.0, color));
+                    }
+                }
+            }
+        }
+        // Скругление углов: вершины выбранной фигуры видны, отмеченные — с оранжевым кольцом.
+        if matches!(edit.op, Some(OpKind::CornerFillet | OpKind::CornerChamfer)) {
+            edit.corners.retain(|_| edit.selected.is_some());
+            if let Some(shape) = edit.selected.and_then(|i| sketch.shapes.get(i)) {
+                for (vi, q) in shape.points().into_iter().enumerate() {
+                    let c = cam.project(rect, plane.to_world(q));
+                    if edit.corners.contains(&vi) {
+                        painter.circle_filled(c, 4.0, Color32::from_rgb(255, 170, 60));
+                        painter.circle_stroke(c, 9.0, Stroke::new(2.0, Color32::from_rgb(255, 170, 60)));
+                    } else {
+                        painter.circle_stroke(c, 6.0, Stroke::new(1.5, Color32::WHITE));
                     }
                 }
             }
