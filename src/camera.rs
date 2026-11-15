@@ -249,6 +249,36 @@ mod tests {
         )
     }
 
+    /// Прямая через начало координат остаётся прямой через проекцию начала при любом вращении.
+    #[test]
+    fn axis_lines_pass_through_projected_origin() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(800.0, 600.0));
+        let mut cam = Camera::default();
+        cam.perspective = true;
+        cam.fov = 60.0;
+        cam.target = DVec3::new(20.0, 10.0, 5.0);
+        cam.scale = 5.0;
+        cam.min_dist = 60.0;
+        let reach = cam.target.length() + 2.0 * 800.0 / cam.scale;
+        for step in 0..72 {
+            cam.yaw = (step as f64 * 5.0).to_radians();
+            for pitch in [-80.0f64, -30.0, 0.0, 35.0, 85.0] {
+                cam.pitch = pitch.to_radians();
+                let o = cam.project(rect, DVec3::ZERO);
+                for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+                    let Some((a, b)) = cam.clip_to_view(rect, axis * -reach, axis * reach) else { continue };
+                    for q in [a, b, (a + b) * 0.5] {
+                        let (pa, pq) = (cam.project(rect, a), cam.project(rect, q));
+                        let (u, v) = (pq - pa, o - pa);
+                        let cross = (u.x * v.y - u.y * v.x).abs();
+                        let scale = (u.length() * v.length()).max(1.0);
+                        assert!(cross / scale < 1e-3, "yaw {} pitch {pitch}: ось {axis:?} мимо начала", cam.yaw);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn matrix_and_projection_agree() {
         let rect = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(800.0, 600.0));
