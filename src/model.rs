@@ -646,6 +646,8 @@ pub enum Relation {
     Perpendicular,
     Collinear,
     Coincident,
+    /// Точка в середине отрезка.
+    Midpoint,
 }
 
 /// Точка или прямая, которую задаёт элемент, — для размеров-расстояний.
@@ -1000,6 +1002,9 @@ impl Sketch {
             (Some(RefGeom::Line(..)), Some(RefGeom::Line(..))) => {
                 vec![Relation::Parallel, Relation::Perpendicular, Relation::Collinear]
             }
+            (Some(RefGeom::Point(_)), Some(RefGeom::Line(..))) | (Some(RefGeom::Line(..)), Some(RefGeom::Point(_))) => {
+                vec![Relation::Coincident, Relation::Midpoint]
+            }
             (Some(_), Some(_)) => vec![Relation::Coincident],
             _ => vec![],
         }
@@ -1009,6 +1014,12 @@ impl Sketch {
         match relation {
             Relation::Coincident => self.set_dim(&Dim::Distance(a, b, DimMode::Aligned), 0.0),
             Relation::Perpendicular => self.set_dim(&Dim::Angle(a, b), 90.0),
+            Relation::Midpoint => match (self.ref_geom(a), self.ref_geom(b)) {
+                // Первый элемент остаётся на месте: точка идёт к середине отрезка, а отрезок — к точке.
+                (Some(RefGeom::Line(p, q)), Some(RefGeom::Point(pt))) => self.move_ref(b, a, (p + q) * 0.5 - pt),
+                (Some(RefGeom::Point(pt)), Some(RefGeom::Line(p, q))) => self.move_ref(b, a, pt - (p + q) * 0.5),
+                _ => Err("середина — это точка и отрезок".into()),
+            },
             Relation::Parallel | Relation::Collinear => {
                 // Поворачиваем в ближайшую сторону: сонаправленно или встречно.
                 let angle = self.line_angle(a, b).ok_or(DIM_GONE)?;
@@ -2295,6 +2306,26 @@ mod tests {
         assert_eq!(part.feature(fillet).unwrap().error, None);
         let FeatureKind::Fillet { edges, .. } = &part.feature(fillet).unwrap().kind else { panic!() };
         assert!((edges[0].x - 55.0).abs() < 1e-6, "{:?}", edges[0]);
+    }
+
+    #[test]
+    fn midpoint_relation() {
+        let shapes = || vec![rect(0.0, 0.0, 10.0, 4.0), SketchShape::Circle { cx: 3.0, cy: 9.0, r: 1.0 }];
+        let seg = DimRef::Segment(0, 0);
+        let point = DimRef::Point(1, 0);
+        let mut s = sketch(shapes());
+        assert!(s.relations(seg, point).contains(&Relation::Midpoint));
+        // Точка идёт к середине отрезка.
+        let before = s.ref_outline(seg);
+        s.apply_relation(seg, point, Relation::Midpoint).unwrap();
+        let mid = (before[0] + before[1]) * 0.5;
+        assert!((s.ref_outline(point)[0] - mid).length() < 1e-9);
+        // Первой выбрана точка — отрезок переезжает к ней.
+        let mut s = sketch(shapes());
+        s.apply_relation(point, seg, Relation::Midpoint).unwrap();
+        let moved = s.ref_outline(seg);
+        assert!(((moved[0] + moved[1]) * 0.5 - DVec2::new(3.0, 9.0)).length() < 1e-9);
+        assert!(s.apply_relation(seg, DimRef::Segment(0, 1), Relation::Midpoint).is_err());
     }
 
     #[test]

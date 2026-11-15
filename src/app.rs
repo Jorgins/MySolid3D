@@ -2771,6 +2771,7 @@ impl App {
                                         Relation::Perpendicular => "Перпендикулярно",
                                         Relation::Collinear => "Коллинеарно",
                                         Relation::Coincident => "Совпадение",
+                                        Relation::Midpoint => "Середина отрезка",
                                     };
                                     if ui.button(name).clicked() {
                                         relation = Some(r);
