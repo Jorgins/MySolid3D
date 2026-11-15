@@ -218,6 +218,16 @@ fn shape_snap_points(s: &SketchShape) -> Vec<DVec2> {
     }
 }
 
+/// Цели привязки в плоскости эскиза.
+#[derive(Default)]
+struct SnapTargets {
+    points: Vec<DVec2>,
+    lines: Vec<Vec<DVec2>>,
+    /// Точки и линии тела: плоское положение и трёхмерное (чтобы отсеять закрытые деталью).
+    body_points: Vec<(DVec2, DVec3)>,
+    body_lines: Vec<Vec<(DVec2, DVec3)>>,
+}
+
 /// Точки и линии эскиза для привязки; `skip` — фигура, которую сейчас переносят.
 fn sketch_snap_targets(sketch: &Sketch, skip: Option<usize>) -> (Vec<DVec2>, Vec<Vec<DVec2>>) {
     let (mut points, mut lines) = (Vec::new(), Vec::new());
@@ -2186,8 +2196,9 @@ impl App {
 
     /// Что видно в плоскости эскиза `id` и подходит для привязки, кроме него самого: начало координат,
     /// более ранние эскизы и рёбра тела (всё проецируется на плоскость эскиза, как и на экране).
-    fn snap_targets(&self, id: u64, plane: &Plane) -> (Vec<DVec2>, Vec<Vec<DVec2>>) {
-        let (mut points, mut lines) = (vec![DVec2::ZERO], Vec::new());
+    /// Точки и линии тела хранятся вместе с трёхмерным положением: те, что закрыты деталью, не нужны.
+    fn snap_targets(&self, id: u64, plane: &Plane) -> SnapTargets {
+        let mut out = SnapTargets { points: vec![DVec2::ZERO], ..Default::default() };
         for feature in &self.part.features {
             if feature.id == id {
                 break;
@@ -2195,17 +2206,17 @@ impl App {
             let FeatureKind::Sketch(other) = &feature.kind else { continue };
             let local = |p: DVec2| plane.to_local(other.plane.to_world(p));
             for shape in &other.shapes {
-                points.extend(shape_snap_points(shape).into_iter().map(local));
-                lines.push(shape.outline().into_iter().map(local).collect());
+                out.points.extend(shape_snap_points(shape).into_iter().map(local));
+                out.lines.push(shape.outline().into_iter().map(local).collect());
             }
         }
         for edge in &self.mesh.edges {
             if let (Some(a), Some(b)) = (edge.points.first(), edge.points.last()) {
-                points.extend([plane.to_local(*a), plane.to_local(*b), plane.to_local(edge.mid)]);
+                out.body_points.extend([*a, *b, edge.mid].map(|p| (plane.to_local(p), p)));
             }
-            lines.push(edge.points.iter().map(|p| plane.to_local(*p)).collect());
+            out.body_lines.push(edge.points.iter().map(|p| (plane.to_local(*p), *p)).collect());
         }
-        (points, lines)
+        out
     }
 
     /// Режим эскиза: рисование фигур, перенос, размеры.
@@ -2217,8 +2228,11 @@ impl App {
         let cam = self.cam.clone();
         let (snap, step) = (self.snap, self.grid_step.max(0.1));
         // Привязка к объектам: сначала к точкам, потом к линиям; без неё — к сетке.
-        let (extra_points, extra_lines) =
-            if self.snap_objects { self.snap_targets(edit.id, &plane) } else { Default::default() };
+        let targets = if self.snap_objects { self.snap_targets(edit.id, &plane) } else { Default::default() };
+        let SnapTargets { points: extra_points, lines: extra_lines, body_points, body_lines } = targets;
+        // Точка тела закрыта, если на пути к глазу есть грань детали.
+        let (mesh, eye) = (self.mesh.clone(), -cam.forward());
+        let hidden = |p: DVec3| mesh.pick_hit(p + eye * 0.02, eye).is_some();
         let skip = if edit.tool == Tool::Select { edit.selected } else { None };
         let (own_points, own_lines) = match (self.snap_objects, self.part.sketch(edit.id)) {
             (true, Some(sketch)) => sketch_snap_targets(sketch, skip),
@@ -2231,6 +2245,26 @@ impl App {
                 let d = (*q - raw).length();
                 if d < reach && best.is_none_or(|(b, _)| d < b) {
                     best = Some((d, *q));
+                }
+            }
+            for (q, p3) in &body_points {
+                let d = (*q - raw).length();
+                if d < reach && best.is_none_or(|(b, _)| d < b) && !hidden(*p3) {
+                    best = Some((d, *q));
+                }
+            }
+            if best.is_none() {
+                for line in &body_lines {
+                    for w in line.windows(2) {
+                        let ab = w[1].0 - w[0].0;
+                        let len2 = ab.length_squared();
+                        let t = if len2 < 1e-12 { 0.0 } else { ((raw - w[0].0).dot(ab) / len2).clamp(0.0, 1.0) };
+                        let q = w[0].0 + ab * t;
+                        let d = (q - raw).length();
+                        if d < reach * 0.7 && best.is_none_or(|(b, _)| d < b) && !hidden(w[0].1 + (w[1].1 - w[0].1) * t) {
+                            best = Some((d, q));
+                        }
+                    }
                 }
             }
             if best.is_none() {
@@ -2521,6 +2555,44 @@ impl App {
             painter.text(at, Align2::LEFT_TOP, text, FontId::proportional(13.0), Color32::from_gray(200));
         }
 
+        // Точки, к которым можно привязаться или поставить размер, видны заранее.
+        let dot_at = |q: DVec2| {
+            let pos = cam.project(rect, plane.to_world(q));
+            rect.contains(pos).then_some(pos)
+        };
+        let drawing = matches!(edit.tool, Tool::Line | Tool::Arc | Tool::Rect | Tool::Circle);
+        if drawing && self.snap_objects {
+            // Чужие точки (более ранние эскизы, тело) — бледные, точки этого эскиза — белые.
+            for pos in extra_points.iter().filter_map(|q| dot_at(*q)).take(3000) {
+                painter.circle_filled(pos, 2.5, Color32::from_rgba_unmultiplied(120, 190, 255, 150));
+            }
+            let visible_body = body_points
+                .iter()
+                .filter_map(|(q, p3)| dot_at(*q).map(|pos| (pos, *p3)))
+                .take(400)
+                .filter(|(_, p3)| !hidden(*p3))
+                .map(|(pos, _)| pos);
+            for pos in visible_body {
+                painter.circle_filled(pos, 2.5, Color32::from_rgba_unmultiplied(120, 190, 255, 150));
+            }
+            for pos in own_points.iter().filter_map(|q| dot_at(*q)) {
+                painter.circle_filled(pos, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 190));
+            }
+        }
+        if edit.tool == Tool::Dimension {
+            for q in sketch.shapes.iter().flat_map(|shape| shape.points()) {
+                if let Some(pos) = dot_at(q) {
+                    painter.circle_stroke(pos, 5.0, Stroke::new(1.5, SKETCH_COLOR));
+                }
+            }
+        }
+        // Начало координат — всегда на виду: от него тоже можно ставить размеры.
+        if let Some(pos) = dot_at(DVec2::ZERO) {
+            let stroke = Stroke::new(1.5, Color32::from_rgb(255, 210, 60));
+            painter.circle_stroke(pos, 6.0, stroke);
+            painter.line_segment([pos - Vec2::new(9.0, 0.0), pos + Vec2::new(9.0, 0.0)], stroke);
+            painter.line_segment([pos - Vec2::new(0.0, 9.0), pos + Vec2::new(0.0, 9.0)], stroke);
+        }
         // Маркер привязки к объекту под курсором.
         if matches!(edit.tool, Tool::Line | Tool::Arc | Tool::Rect | Tool::Circle) {
             if let Some(q) = pointer.and_then(raw_at).and_then(nearest_object) {
