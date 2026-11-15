@@ -1134,17 +1134,56 @@ impl Sketch {
             Pick::Ref(r) => r,
             Pick::Mid(s, i) => DimRef::Segment(s, i),
         };
-        self.nudge(as_ref(a), as_ref(b), d)
+        self.nudge(as_ref(a), as_ref(b), d, None)
     }
 
     /// Сдвигает `b` на `d` относительно `a`; если `b` неподвижен (начало координат, другой эскиз) —
     /// вместо него на `-d` сдвигается `a`.
-    fn nudge(&mut self, a: DimRef, b: DimRef, d: DVec2) -> Result<(), String> {
-        match (immovable(a), immovable(b)) {
-            (true, true) => Err("оба элемента неподвижны — ничего двигать".into()),
-            (_, true) => self.move_ref(a, b, -d),
-            _ => self.move_ref(b, a, d),
+    fn nudge(&mut self, a: DimRef, b: DimRef, d: DVec2, except: Option<&Dim>) -> Result<(), String> {
+        let (mover, other, delta) = match (immovable(a), immovable(b)) {
+            (true, true) => return Err("оба элемента неподвижны — ничего двигать".into()),
+            (_, true) => (a, b, -d),
+            _ => (b, a, d),
+        };
+        // Если другой элемент этой же фигуры уже закреплён размером, фигуру целиком не сдвигаем:
+        // меняется её форма (например, размер прямоугольника), а прежнее условие остаётся в силе.
+        let own = match mover {
+            DimRef::Point(s, _) | DimRef::Segment(s, _) | DimRef::Circle(s) => Some(s),
+            _ => None,
+        };
+        match own.and_then(|s| self.pinned_ref(s, mover, except)) {
+            Some(pin) => self.move_ref(mover, pin, delta),
+            None => self.move_ref(mover, other, delta),
         }
+    }
+
+    /// Элемент фигуры `shape` (кроме `mover` и общих с ним точек), положение которого уже задано размером
+    /// от чего-то вне фигуры; размер `except` не в счёт — его как раз сейчас меняют.
+    fn pinned_ref(&self, shape: usize, mover: DimRef, except: Option<&Dim>) -> Option<DimRef> {
+        let n = self.shapes.get(shape)?.points().len();
+        if matches!(self.shapes[shape], SketchShape::Circle { .. }) {
+            return None;
+        }
+        let points = |r: DimRef| match r {
+            DimRef::Point(_, i) => vec![i],
+            DimRef::Segment(_, i) => vec![i, (i + 1) % n.max(1)],
+            _ => vec![],
+        };
+        let on_shape = |r: DimRef| matches!(r, DimRef::Point(s, _) | DimRef::Segment(s, _) if s == shape);
+        let mover_points = points(mover);
+        for dim in self.dims.iter().filter(|d| Some(*d) != except) {
+            let Dim::Distance(a, b, _) = dim else { continue };
+            // Размер между двумя элементами одной фигуры — внутренний, он положение не закрепляет.
+            if on_shape(*a) && on_shape(*b) {
+                continue;
+            }
+            for r in [*a, *b] {
+                if on_shape(r) && points(r).iter().all(|p| !mover_points.contains(p)) {
+                    return Some(r);
+                }
+            }
+        }
+        None
     }
 
     /// Элемент эскиза рядом с точкой `p`; точки важнее линий.
@@ -1339,8 +1378,8 @@ impl Sketch {
             Relation::Vertical => self.set_dim(&Dim::Distance(a, b, DimMode::Horizontal), 0.0),
             Relation::Midpoint => match (self.ref_geom(a), self.ref_geom(b)) {
                 // Первый элемент остаётся на месте: точка идёт к середине отрезка, а отрезок — к точке.
-                (Some(RefGeom::Line(p, q)), Some(RefGeom::Point(pt))) => self.nudge(a, b, (p + q) * 0.5 - pt),
-                (Some(RefGeom::Point(pt)), Some(RefGeom::Line(p, q))) => self.nudge(a, b, pt - (p + q) * 0.5),
+                (Some(RefGeom::Line(p, q)), Some(RefGeom::Point(pt))) => self.nudge(a, b, (p + q) * 0.5 - pt, None),
+                (Some(RefGeom::Point(pt)), Some(RefGeom::Line(p, q))) => self.nudge(a, b, pt - (p + q) * 0.5, None),
                 _ => Err("середина — это точка и отрезок".into()),
             },
             Relation::Parallel | Relation::Collinear => {
@@ -1503,7 +1542,7 @@ impl Sketch {
                     return Ok(());
                 }
                 // Начало координат и элементы других эскизов неподвижны: двигается тот, что свой.
-                self.nudge(a, b, d)
+                self.nudge(a, b, d, Some(dim))
             }
             Dim::Angle(a, b) => {
                 if !(0.0..=180.0).contains(&value) {
@@ -3082,6 +3121,27 @@ mod tests {
         assert_eq!(p.points()[2], DVec2::new(20.0, 20.0));
         let SketchShape::Path { points, .. } = &p else { panic!() };
         assert!((points[0].bulge - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn second_offset_resizes_instead_of_moving() {
+        let mut s = Sketch::new(Plane::TOP, vec![rect(0.0, 0.0, 40.0, 30.0)]);
+        let (left, right) = (DimRef::Point(0, 0), DimRef::Point(0, 1));
+        let from_left = Dim::Distance(DimRef::Origin, left, DimMode::Horizontal);
+        let from_right = Dim::Distance(DimRef::Origin, right, DimMode::Horizontal);
+        // Первый отступ сдвигает фигуру целиком.
+        s.store_dim(from_left);
+        s.set_dim(&from_left, 5.0).unwrap();
+        assert_eq!(s.shapes[0], rect(5.0, 0.0, 40.0, 30.0));
+        // Второй — от противоположной стороны: первый отступ остаётся, меняется ширина.
+        s.store_dim(from_right);
+        s.set_dim(&from_right, 50.0).unwrap();
+        assert_eq!(s.shapes[0], rect(5.0, 0.0, 45.0, 30.0));
+        assert!((s.dim_value(&from_left).unwrap() - 5.0).abs() < 1e-9);
+        // Теперь меняем первый: правый край стоит на месте, меняется ширина с другой стороны.
+        s.set_dim(&from_left, 8.0).unwrap();
+        assert_eq!(s.shapes[0], rect(8.0, 0.0, 42.0, 30.0));
+        assert!((s.dim_value(&from_right).unwrap() - 50.0).abs() < 1e-9);
     }
 
     #[test]
