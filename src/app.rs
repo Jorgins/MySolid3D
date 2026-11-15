@@ -57,6 +57,15 @@ enum Tool {
     Dimension,
 }
 
+/// Что делает мышь с картинкой-подложкой.
+#[derive(Clone, Copy)]
+enum ImageDrag {
+    /// Сдвиг: последняя точка курсора.
+    Move(DVec2),
+    /// Масштаб вокруг неподвижного противоположного угла.
+    Scale(DVec2),
+}
+
 /// Состояние редактирования эскиза.
 struct SketchEdit {
     id: u64,
@@ -79,6 +88,9 @@ struct SketchEdit {
     labels: Vec<(Rect, usize)>,
     /// Размер (номер в `Sketch::dims`), который сейчас перетаскивают за подпись.
     drag_label: Option<usize>,
+    /// Картинка-подложка выбрана (видны угловые маркеры) и что с ней делает мышь.
+    image_sel: bool,
+    image_drag: Option<ImageDrag>,
     /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
     line_menu: Option<(usize, usize)>,
     /// Открытое окно операции над выбранной фигурой и введённые в нём параметры.
@@ -101,6 +113,8 @@ impl SketchEdit {
             placing: None,
             labels: Vec::new(),
             drag_label: None,
+            image_sel: false,
+            image_drag: None,
             line_menu: None,
             op: None,
             params: OpParams::default(),
@@ -506,7 +520,7 @@ pub struct App {
     /// Область 3D-вида на прошлом кадре (для кнопок масштаба).
     view_rect: Rect,
     /// Загруженная картинка-подложка: (путь, текстура и отношение высоты к ширине).
-    image_tex: Option<(String, Option<(egui::TextureHandle, f32)>)>,
+    image_tex: std::collections::HashMap<String, Option<(egui::TextureHandle, f32)>>,
     /// История для отмены и повтора: состояния детали до каждого изменения.
     undo: Vec<Part>,
     redo: Vec<Part>,
@@ -624,7 +638,7 @@ impl App {
             need_fit: false,
             render_mode: RenderMode::Solid,
             view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0)),
-            image_tex: None,
+            image_tex: Default::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             base: Part::default(),
@@ -1289,18 +1303,17 @@ impl App {
                         opacity: 0.5,
                     });
                 }
-                self.status = "Картинка добавлена: размер и положение — в свойствах эскиза".into();
+                self.status = "Картинка добавлена: инструментом «Выбрать» щёлкните по ней, тяните — сдвиг, угловые маркеры — размер (числа — в свойствах эскиза)".into();
             }
             Ok(_) => self.status = "В картинке нет пикселей".into(),
             Err(e) => self.status = format!("Не удалось прочитать картинку: {e}"),
         }
     }
 
-    /// Рисует подложку эскиза на его плоскости (до сетки и фигур).
-    fn draw_image(&mut self, painter: &Painter, rect: Rect, id: u64, plane: &Plane) {
-        let Some(img) = self.part.sketch(id).and_then(|s| s.image.clone()) else { return };
-        if self.image_tex.as_ref().is_none_or(|(path, _)| *path != img.path) {
-            let loaded = match image::open(&img.path) {
+    /// Текстура картинки-подложки (грузится один раз на путь) и отношение высоты к ширине.
+    fn image_texture(&mut self, ctx: &egui::Context, path: &str) -> Option<(egui::TextureId, f32)> {
+        if !self.image_tex.contains_key(path) {
+            let loaded = match image::open(path) {
                 Ok(pic) => {
                     // Огромные картинки уменьшаем: текстуре хватает 2048 пикселей.
                     let pic = if pic.width().max(pic.height()) > 2048 {
@@ -1311,22 +1324,27 @@ impl App {
                     let rgba = pic.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                    let tex = painter.ctx().load_texture("sketch_image", color, egui::TextureOptions::LINEAR);
+                    let tex = ctx.load_texture(format!("sketch_image_{path}"), color, egui::TextureOptions::LINEAR);
                     Some((tex, rgba.height() as f32 / rgba.width() as f32))
                 }
                 Err(e) => {
-                    self.status = format!("Не удалось открыть картинку {}: {e}", img.path);
+                    self.status = format!("Не удалось открыть картинку {path}: {e}");
                     None
                 }
             };
-            self.image_tex = Some((img.path.clone(), loaded));
+            self.image_tex.insert(path.to_string(), loaded);
         }
-        let Some((tex, aspect)) = self.image_tex.as_ref().and_then(|(_, t)| t.as_ref()) else { return };
-        let height = img.width * *aspect as f64;
+        self.image_tex.get(path).and_then(|t| t.as_ref()).map(|(tex, aspect)| (tex.id(), *aspect))
+    }
+
+    /// Рисует подложку эскиза на его плоскости.
+    fn draw_image(&mut self, painter: &Painter, rect: Rect, img: &SketchImage, plane: &Plane) {
+        let Some((tex, aspect)) = self.image_texture(painter.ctx(), &img.path) else { return };
+        let height = img.width * aspect as f64;
         let corner = |dx: f64, dy: f64| self.cam.project(rect, plane.to_world(DVec2::new(img.x + dx, img.y + dy)));
         let color = Color32::from_white_alpha((img.opacity.clamp(0.0, 1.0) * 255.0) as u8);
         let vertex = |pos: Pos2, u: f32, v: f32| egui::epaint::Vertex { pos, uv: Pos2::new(u, v), color };
-        let mut mesh = egui::Mesh::with_texture(tex.id());
+        let mut mesh = egui::Mesh::with_texture(tex);
         mesh.vertices.push(vertex(corner(0.0, height), 0.0, 0.0));
         mesh.vertices.push(vertex(corner(img.width, height), 1.0, 0.0));
         mesh.vertices.push(vertex(corner(img.width, 0.0), 1.0, 1.0));
@@ -1334,6 +1352,24 @@ impl App {
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(0, 2, 3);
         painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Картинки эскизов на 3D-виде (редактируемый эскиз рисует сам режим эскиза).
+    fn draw_images(&mut self, painter: &Painter, rect: Rect) {
+        let editing = self.sketch.as_ref().map(|e| e.id);
+        let images: Vec<(SketchImage, Plane)> = self
+            .part
+            .features
+            .iter()
+            .filter(|f| Some(f.id) != editing)
+            .filter_map(|f| match &f.kind {
+                FeatureKind::Sketch(s) => s.image.clone().map(|i| (i, s.plane)),
+                _ => None,
+            })
+            .collect();
+        for (img, plane) in images {
+            self.draw_image(painter, rect, &img, &plane);
+        }
     }
 
     /// Окно параметров операции над выбранной фигурой эскиза.
@@ -1879,6 +1915,7 @@ impl App {
             })),
         });
 
+        self.draw_images(&painter, rect);
         self.draw_edge_highlights(&painter, rect);
         self.draw_errors(&painter, rect);
         self.draw_base_planes(&painter, rect);
@@ -2304,7 +2341,17 @@ impl App {
     /// Режим эскиза: рисование фигур, перенос, размеры.
     fn sketch_mode(&mut self, ui: &egui::Ui, resp: &Response, painter: &Painter, rect: Rect, edit: &mut SketchEdit) {
         let Some(plane) = self.part.sketch(edit.id).map(|s| s.plane) else { return };
-        self.draw_image(painter, rect, edit.id, &plane);
+        if let Some(img) = self.part.sketch(edit.id).and_then(|s| s.image.clone()) {
+            self.draw_image(painter, rect, &img, &plane);
+        }
+        // Отношение сторон картинки — для перетаскивания и масштаба мышью.
+        let image_aspect = self
+            .part
+            .sketch(edit.id)
+            .and_then(|s| s.image.as_ref())
+            .and_then(|i| self.image_tex.get(&i.path))
+            .and_then(|t| t.as_ref())
+            .map(|(_, a)| *a as f64);
         self.draw_grid(painter, rect, &plane);
 
         let cam = self.cam.clone();
@@ -2527,7 +2574,7 @@ impl App {
                         edit.drag_vertex = None;
                     }
                 }
-                let dragging_vertex = edit.drag_vertex.is_some();
+                let mut dragging_vertex = edit.drag_vertex.is_some();
                 let pick = |sketch: &Sketch, p: DVec2| {
                     sketch
                         .shapes
@@ -2538,6 +2585,62 @@ impl App {
                         .min_by(|a, b| a.1.total_cmp(&b.1))
                         .map(|(i, _)| i)
                 };
+                // Картинка-подложка: щелчок выбирает её, перетаскивание сдвигает, угловые маркеры меняют размер.
+                let image_box = sketch
+                    .image
+                    .as_ref()
+                    .zip(image_aspect)
+                    .map(|(i, a)| (DVec2::new(i.x, i.y), DVec2::new(i.x + i.width, i.y + i.width * a)));
+                let on_image = |p: DVec2| image_box.is_some_and(|(lo, hi)| p.cmpge(lo).all() && p.cmple(hi).all());
+                let handle_hit = |p: DVec2, sel: bool| {
+                    let (lo, hi) = image_box?;
+                    if !sel {
+                        return None;
+                    }
+                    let corners = [lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)];
+                    corners.iter().position(|c| (*c - p).length() < 10.0 * px).map(|i| corners[(i + 2) % 4])
+                };
+                if resp.drag_started_by(primary) && !dragging_vertex {
+                    edit.image_drag = None;
+                    if let Some(p) = press.and_then(raw_at) {
+                        if let Some(anchor) = handle_hit(p, edit.image_sel) {
+                            edit.image_drag = Some(ImageDrag::Scale(anchor));
+                        } else if on_image(p) && pick(sketch, p).is_none() {
+                            edit.image_sel = true;
+                            edit.selected = None;
+                            edit.image_drag = Some(ImageDrag::Move(p));
+                        }
+                    }
+                } else if clicked {
+                    let p = pointer.and_then(raw_at);
+                    edit.image_sel = p.is_some_and(|p| {
+                        pick(sketch, p).is_none() && (on_image(p) || handle_hit(p, edit.image_sel).is_some())
+                    });
+                }
+                if let Some(drag) = edit.image_drag {
+                    if resp.drag_stopped_by(primary) || !resp.dragged_by(primary) {
+                        edit.image_drag = None;
+                    } else if let (Some(cur), Some(img), Some(aspect)) =
+                        (pointer.and_then(raw_at), sketch.image.as_mut(), image_aspect)
+                    {
+                        match drag {
+                            ImageDrag::Move(last) => {
+                                img.x += cur.x - last.x;
+                                img.y += cur.y - last.y;
+                                edit.image_drag = Some(ImageDrag::Move(cur));
+                            }
+                            ImageDrag::Scale(anchor) => {
+                                let d = cur - anchor;
+                                let width = ((d.x.abs() + d.y.abs() / aspect) / 2.0).max(MIN_SIZE);
+                                img.width = width;
+                                img.x = if d.x >= 0.0 { anchor.x } else { anchor.x - width };
+                                img.y = if d.y >= 0.0 { anchor.y } else { anchor.y - width * aspect };
+                            }
+                        }
+                    }
+                }
+                // Пока тянут картинку, фигуры не трогаем.
+                dragging_vertex |= edit.image_drag.is_some();
                 if dragging_vertex {
                     edit.move_last = None;
                 } else if resp.drag_started_by(primary) {
@@ -2641,6 +2744,16 @@ impl App {
                         painter.circle_stroke(pos, 7.0, Stroke::new(1.0, color));
                     }
                 }
+            }
+        }
+        if let (true, Some(img), Some(aspect)) = (edit.image_sel, sketch.image.as_ref(), image_aspect) {
+            let (lo, hi) = (DVec2::new(img.x, img.y), DVec2::new(img.x + img.width, img.y + img.width * aspect));
+            let corners = [lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)]
+                .map(|c| cam.project(rect, plane.to_world(c)));
+            let stroke = Stroke::new(1.5, SELECT_COLOR);
+            painter.add(egui::Shape::closed_line(corners.to_vec(), stroke));
+            for c in corners {
+                painter.rect_filled(Rect::from_center_size(c, Vec2::splat(9.0)), 1.0, SELECT_COLOR);
             }
         }
         sketch.prune_dim_places();
