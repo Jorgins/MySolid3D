@@ -113,6 +113,15 @@ enum ImageDrag {
     Scale(DVec2),
 }
 
+/// Что мышь делает с группой выбранных фигур.
+#[derive(Clone, Copy)]
+enum GroupDrag {
+    /// Сдвиг: последняя точка курсора.
+    Move(DVec2),
+    /// Масштаб вокруг неподвижного угла рамки: прежнее расстояние курсора до него.
+    Scale { anchor: DVec2, last: f64 },
+}
+
 /// Состояние редактирования эскиза.
 struct SketchEdit {
     id: u64,
@@ -138,6 +147,9 @@ struct SketchEdit {
     /// Картинка-подложка выбрана (видны угловые маркеры) и что с ней делает мышь.
     image_sel: bool,
     image_drag: Option<ImageDrag>,
+    /// Группа выбранных фигур (после импорта SVG, Ctrl+A, Shift+щелчок): двигаются и масштабируются вместе.
+    multi: Vec<usize>,
+    group_drag: Option<GroupDrag>,
     /// Точки (и начало координат), выбранные стрелкой для связи: до двух.
     points_sel: Vec<DimRef>,
     /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
@@ -164,6 +176,8 @@ impl SketchEdit {
             drag_label: None,
             image_sel: false,
             image_drag: None,
+            multi: Vec::new(),
+            group_drag: None,
             points_sel: Vec::new(),
             line_menu: None,
             op: None,
@@ -1274,6 +1288,14 @@ impl App {
         add_image = ui.button("Картинка").on_hover_text(
             "Вставить картинку-подложку: по ней удобно обводить контуры. Размер и положение — в свойствах эскиза.",
         ).clicked() || add_image;
+        let import_svg = ui
+            .button("SVG")
+            .on_hover_text(
+                "Импорт контуров из SVG-файла в этот эскиз (путь, прямоугольник, окружность, линия, многоугольник).\n\
+                 Размеры берутся в миллиметрах, центр рисунка — в начале координат.\n\
+                 Импортированное выбрано группой: тяните — сдвиг, угловые маркеры — масштаб.",
+            )
+            .clicked();
         ui.separator();
         ui.checkbox(&mut self.snap, "Привязка к сетке");
         ui.checkbox(&mut self.snap_objects, "Привязка к объектам")
@@ -1282,6 +1304,31 @@ impl App {
             .on_hover_text("Шаг сетки");
         if add_image {
             self.add_image();
+        }
+        if import_svg {
+            self.import_svg();
+        }
+    }
+
+    /// Импорт контуров из SVG в редактируемый эскиз; импортированное выбирается группой.
+    fn import_svg(&mut self) {
+        let Some(id) = self.sketch.as_ref().map(|e| e.id) else { return };
+        let Some(path) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file() else { return };
+        let shapes = std::fs::read_to_string(&path).map_err(|e| format!("Не удалось прочитать файл: {e}")).and_then(|t| crate::svg::parse(&t));
+        match shapes {
+            Ok(shapes) => {
+                let Some(sketch) = self.part.sketch_mut(id) else { return };
+                let first = sketch.shapes.len();
+                let count = shapes.len();
+                sketch.shapes.extend(shapes);
+                if let Some(edit) = self.sketch.as_mut() {
+                    edit.multi = (first..first + count).collect();
+                    edit.selected = None;
+                    edit.tool = Tool::Select;
+                }
+                self.status = format!("Импортировано контуров: {count}. Тяните — сдвиг, угловые маркеры — масштаб");
+            }
+            Err(e) => self.status = format!("SVG не импортирован: {e}"),
         }
     }
 
@@ -2595,7 +2642,18 @@ impl App {
                 edit.tool = Tool::Select;
             }
         }
-        if no_focus && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+        if no_focus && ui.input(|i| i.key_pressed(egui::Key::Delete)) && !edit.multi.is_empty() {
+            // Удаляется вся группа; с конца, чтобы номера не сдвигались.
+            let mut group = std::mem::take(&mut edit.multi);
+            group.sort_unstable_by(|a, b| b.cmp(a));
+            group.dedup();
+            for i in group {
+                sketch.remove_shape(i);
+            }
+            edit.selected = None;
+            edit.dim_first = None;
+            self.dim_edit = None;
+        } else if no_focus && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
             edit.stop_chain();
             if let Some(i) = edit.selected.take().filter(|&i| i < sketch.shapes.len()) {
                 sketch.remove_shape(i);
@@ -2771,8 +2829,83 @@ impl App {
                         None => edit.points_sel.clear(),
                     }
                 }
-                // Пока тянут картинку, фигуры не трогаем.
-                dragging_vertex |= edit.image_drag.is_some();
+                // Группа фигур: рамка с угловыми маркерами; протяжка за любую фигуру группы двигает всю группу.
+                edit.multi.retain(|&i| i < sketch.shapes.len());
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) && no_focus {
+                    edit.multi = (0..sketch.shapes.len()).collect();
+                    edit.selected = None;
+                }
+                let group_box = (!edit.multi.is_empty()).then(|| {
+                    edit.multi.iter().flat_map(|&i| sketch.shapes[i].outline()).fold(
+                        (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)),
+                        |(lo, hi), p| (lo.min(p), hi.max(p)),
+                    )
+                });
+                let on_member = |sketch: &Sketch, multi: &[usize], p: DVec2| {
+                    multi.iter().any(|&i| sketch.shapes[i].outline_distance(p) < 8.0 * px)
+                };
+                let group_handle = |p: DVec2| {
+                    let (lo, hi) = group_box?;
+                    let corners = [lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)];
+                    corners.iter().position(|c| (*c - p).length() < 10.0 * px).map(|i| corners[(i + 2) % 4])
+                };
+                if group_box.is_some() && edit.image_drag.is_none() {
+                    if resp.drag_started_by(primary) && !dragging_vertex {
+                        edit.group_drag = None;
+                        if let Some(p) = press.and_then(raw_at) {
+                            if let Some(anchor) = group_handle(p) {
+                                edit.group_drag = Some(GroupDrag::Scale { anchor, last: (p - anchor).length().max(1e-9) });
+                            } else if on_member(sketch, &edit.multi, p) {
+                                edit.group_drag = Some(GroupDrag::Move(p));
+                            }
+                        }
+                    } else if clicked {
+                        let p = pointer.and_then(raw_at);
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        if shift {
+                            // Shift+щелчок добавляет фигуру в группу или убирает её.
+                            if let Some(i) = p.and_then(|p| pick(sketch, p)) {
+                                match edit.multi.iter().position(|&m| m == i) {
+                                    Some(at) => drop(edit.multi.remove(at)),
+                                    None => edit.multi.push(i),
+                                }
+                            }
+                        } else if p.is_some_and(|p| group_handle(p).is_none() && !on_member(sketch, &edit.multi, p)) {
+                            edit.multi.clear();
+                        }
+                    }
+                } else if clicked && ui.input(|i| i.modifiers.shift) {
+                    // Группы ещё нет — Shift+щелчок начинает её с выбранной и этой фигуры.
+                    if let Some(i) = pointer.and_then(raw_at).and_then(|p| pick(sketch, p)) {
+                        edit.multi = edit.selected.into_iter().filter(|&s| s != i).chain([i]).collect();
+                    }
+                }
+                if let Some(drag) = edit.group_drag {
+                    if resp.drag_stopped_by(primary) || !resp.dragged_by(primary) {
+                        edit.group_drag = None;
+                    } else if let Some(cur) = pointer.and_then(raw_at) {
+                        match drag {
+                            GroupDrag::Move(last) => {
+                                for &i in &edit.multi {
+                                    sketch.shapes[i].translate(cur - last);
+                                }
+                                edit.group_drag = Some(GroupDrag::Move(cur));
+                            }
+                            GroupDrag::Scale { anchor, last } => {
+                                let now = (cur - anchor).length();
+                                let factor = now / last;
+                                if now > 1e-6 && factor.is_finite() && (0.05..20.0).contains(&factor) {
+                                    for &i in &edit.multi {
+                                        let _ = sketch.shapes[i].scale(anchor, factor);
+                                    }
+                                    edit.group_drag = Some(GroupDrag::Scale { anchor, last: now });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Пока тянут картинку или группу, фигуры не трогаем.
+                dragging_vertex |= edit.image_drag.is_some() || edit.group_drag.is_some();
                 if dragging_vertex {
                     edit.move_last = None;
                 } else if resp.drag_started_by(primary) {
@@ -2886,6 +3019,28 @@ impl App {
             painter.add(egui::Shape::closed_line(corners.to_vec(), stroke));
             for c in corners {
                 painter.rect_filled(Rect::from_center_size(c, Vec2::splat(9.0)), 1.0, SELECT_COLOR);
+            }
+        }
+        if !edit.multi.is_empty() && edit.tool == Tool::Select {
+            let (lo, hi) = edit.multi.iter().filter_map(|&i| sketch.shapes.get(i)).flat_map(|s| s.outline()).fold(
+                (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)),
+                |(lo, hi), p| (lo.min(p), hi.max(p)),
+            );
+            if lo.is_finite() && hi.is_finite() {
+                let corners = [lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)]
+                    .map(|c| cam.project(rect, plane.to_world(c)));
+                let color = Color32::from_rgb(255, 170, 60);
+                let mut closed = corners.to_vec();
+                closed.push(corners[0]);
+                painter.extend(egui::Shape::dashed_line(&closed, Stroke::new(1.5, color), 7.0, 5.0));
+                for c in corners {
+                    painter.rect_filled(Rect::from_center_size(c, Vec2::splat(9.0)), 1.0, color);
+                }
+                for &i in &edit.multi {
+                    if let Some(shape) = sketch.shapes.get(i) {
+                        draw_shape(painter, &cam, rect, &plane, shape, Stroke::new(2.0, color));
+                    }
+                }
             }
         }
         // Точки, выбранные стрелкой: кольца и панель со связями между ними.
