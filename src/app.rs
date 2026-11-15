@@ -5,7 +5,7 @@ use crate::model::{
     bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Material, Part, PathPoint, Pick, Plane, Relation,
     RenderMesh, Sketch, SketchImage, SketchShape, TreeItem, MIN_SIZE,
 };
-use crate::render::{DrawParams, RenderMode, Renderer};
+use crate::render::{DrawParams, ImageItem, RenderMode, Renderer};
 
 mod api;
 use eframe::egui::{
@@ -618,6 +618,9 @@ pub struct App {
     view_rect: Rect,
     /// Загруженная картинка-подложка: (путь, текстура и отношение высоты к ширине).
     image_tex: std::collections::HashMap<String, Option<(egui::TextureHandle, f32)>>,
+    /// Картинки-подложки в сцене OpenGL: их набор на момент последней загрузки в видеокарту и готовые пиксели.
+    gl_images_key: String,
+    decoded_images: std::collections::HashMap<String, Option<(u32, u32, std::sync::Arc<Vec<u8>>)>>,
     /// Сервер для управления программой извне (нейросети, скрипты) и очередь его запросов.
     api: Option<crate::server::ApiServer>,
     api_rx: Option<std::sync::mpsc::Receiver<crate::server::ApiRequest>>,
@@ -743,6 +746,8 @@ impl App {
             view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0)),
             image_tex: Default::default(),
             region_hover: None,
+            gl_images_key: String::new(),
+            decoded_images: Default::default(),
             api: None,
             api_rx: None,
             api_port: 8765,
@@ -1561,10 +1566,11 @@ impl App {
         }
     }
 
-    /// Картинки эскизов на 3D-виде (редактируемый эскиз рисует сам режим эскиза).
-    fn draw_images(&mut self, painter: &Painter, rect: Rect) {
+    /// Картинки эскизов на 3D-виде рисуются в сцене OpenGL (редактируемый эскиз рисует сам режим эскиза):
+    /// так деталь, вытянутая перед рисунком, его закрывает. В видеокарту загружается только при изменении набора.
+    fn sync_gl_images(&mut self, frame: &eframe::Frame) {
         let editing = self.sketch.as_ref().map(|e| e.id);
-        let images: Vec<(SketchImage, Plane)> = self
+        let wanted: Vec<(SketchImage, Plane)> = self
             .part
             .features
             .iter()
@@ -1574,8 +1580,41 @@ impl App {
                 _ => None,
             })
             .collect();
-        for (img, plane) in images {
-            self.draw_image(painter, rect, &img, &plane);
+        let key = format!("{wanted:?}");
+        if key == self.gl_images_key {
+            return;
+        }
+        let mut items = Vec::new();
+        for (img, plane) in &wanted {
+            if !self.decoded_images.contains_key(&img.path) {
+                let decoded = image::open(&img.path).ok().map(|pic| {
+                    // Огромные картинки уменьшаем: текстуре хватает 2048 пикселей.
+                    let pic = if pic.width().max(pic.height()) > 2048 {
+                        pic.resize(2048, 2048, image::imageops::FilterType::Triangle)
+                    } else {
+                        pic
+                    };
+                    let rgba = pic.to_rgba8();
+                    (rgba.width(), rgba.height(), std::sync::Arc::new(rgba.into_raw()))
+                });
+                self.decoded_images.insert(img.path.clone(), decoded);
+            }
+            let Some((w, h, pixels)) = self.decoded_images.get(&img.path).and_then(|d| d.clone()) else { continue };
+            let height = img.width * h as f64 / w as f64;
+            let at = |dx: f64, dy: f64| {
+                let p = plane.to_world(DVec2::new(img.x + dx, img.y + dy));
+                [p.x as f32, p.y as f32, p.z as f32]
+            };
+            items.push(ImageItem {
+                corners: [at(0.0, 0.0), at(img.width, 0.0), at(img.width, height), at(0.0, height)],
+                size: (w, h),
+                rgba: pixels,
+                alpha: img.opacity.clamp(0.0, 1.0),
+            });
+        }
+        if let Some(gl) = frame.gl() {
+            self.renderer.lock().unwrap().set_images(gl, &items);
+            self.gl_images_key = key;
         }
     }
 
@@ -2183,7 +2222,6 @@ impl App {
             })),
         });
 
-        self.draw_images(&painter, rect);
         self.draw_regions(&painter, rect);
         self.draw_edge_highlights(&painter, rect);
         // Ребро под курсором: его длина рядом с курсором.
@@ -3895,6 +3933,7 @@ impl eframe::App for App {
             self.colors_dirty = true;
         }
         self.api_poll(frame);
+        self.sync_gl_images(frame);
         if self.dirty {
             self.rebuild(frame);
         }

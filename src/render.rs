@@ -103,6 +103,44 @@ void main() {
 }
 "#;
 
+const IMG_VS: &str = r#"#version 330 core
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec2 a_uv;
+uniform mat4 u_view_proj;
+out vec2 v_uv;
+void main() {
+    v_uv = a_uv;
+    gl_Position = u_view_proj * vec4(a_pos, 1.0);
+}
+"#;
+
+const IMG_FS: &str = r#"#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform float u_alpha;
+out vec4 o_color;
+void main() {
+    vec4 c = texture(u_tex, v_uv);
+    o_color = vec4(c.rgb, c.a * u_alpha);
+}
+"#;
+
+/// Картинка-подложка эскиза в мире: четыре угла (левый нижний, правый нижний, правый верхний, левый верхний),
+/// пиксели RGBA построчно сверху вниз и прозрачность.
+pub struct ImageItem {
+    pub corners: [[f32; 3]; 4],
+    pub size: (u32, u32),
+    pub rgba: std::sync::Arc<Vec<u8>>,
+    pub alpha: f32,
+}
+
+struct GlImage {
+    vao: glow::VertexArray,
+    vbo: glow::Buffer,
+    texture: glow::Texture,
+    alpha: f32,
+}
+
 pub struct DrawParams {
     pub view_proj: [f32; 16],
     pub normal_mat: [f32; 9],
@@ -156,6 +194,9 @@ pub struct Renderer {
     edge_vertex_count: i32,
     /// В детали есть стеклянные грани — нужен второй (прозрачный) проход.
     has_glass: bool,
+    /// Картинки-подложки рисуются в сцене с проверкой глубины: деталь, которая ближе к глазу, их закрывает.
+    image_program: glow::Program,
+    images: Vec<GlImage>,
 }
 
 fn as_bytes<T: Copy>(data: &[T]) -> &[u8] {
@@ -192,6 +233,7 @@ impl Renderer {
         unsafe {
             let mesh_program = compile(gl, MESH_VS, MESH_FS)?;
             let edge_program = compile(gl, EDGE_VS, EDGE_FS)?;
+            let image_program = compile(gl, IMG_VS, IMG_FS)?;
 
             let mesh_vao = gl.create_vertex_array()?;
             let mesh_vbo = gl.create_buffer()?;
@@ -233,6 +275,8 @@ impl Renderer {
                 index_count: 0,
                 edge_vertex_count: 0,
                 has_glass: false,
+                image_program,
+                images: Vec::new(),
             })
         }
     }
@@ -255,6 +299,58 @@ impl Renderer {
         }
         self.index_count = mesh.indices.len() as i32;
         self.edge_vertex_count = (mesh.edge_lines.len() / 3) as i32;
+    }
+
+    /// Заменяет картинки-подложки сцены (старые текстуры освобождаются).
+    pub fn set_images(&mut self, gl: &glow::Context, items: &[ImageItem]) {
+        unsafe {
+            for img in self.images.drain(..) {
+                gl.delete_texture(img.texture);
+                gl.delete_buffer(img.vbo);
+                gl.delete_vertex_array(img.vao);
+            }
+            for item in items {
+                let (Ok(vao), Ok(vbo), Ok(texture)) = (gl.create_vertex_array(), gl.create_buffer(), gl.create_texture())
+                else {
+                    continue;
+                };
+                // Позиция (3) и координаты текстуры (2) на вершину; обход: веер из четырёх вершин.
+                let uv = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+                let mut data: Vec<f32> = Vec::with_capacity(20);
+                for (c, t) in item.corners.iter().zip(uv) {
+                    data.extend_from_slice(c);
+                    data.extend_from_slice(&t);
+                }
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&data), glow::STATIC_DRAW);
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 20, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 20, 12);
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    item.size.0 as i32,
+                    item.size.1 as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(item.rgba.as_slice())),
+                );
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                self.images.push(GlImage { vao, vbo, texture, alpha: item.alpha });
+            }
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
     }
 
     /// Цвета вершин: по четыре числа на вершину (r, g, b, номер материала), в том же порядке, что и в сетке.
@@ -325,6 +421,30 @@ impl Renderer {
                 gl.depth_mask(true);
             }
             gl.disable(glow::POLYGON_OFFSET_FILL);
+            // Картинки-подложки: после тела, с проверкой глубины (ближняя часть детали закрывает рисунок);
+            // чуть ближе к глазу, чем плоскость эскиза, — иначе рисунок мерцает на совпадающих гранях.
+            if !self.images.is_empty() {
+                gl.use_program(Some(self.image_program));
+                gl.uniform_matrix_4_f32_slice(gl.get_uniform_location(self.image_program, "u_view_proj").as_ref(), false, &p.view_proj);
+                gl.uniform_1_i32(gl.get_uniform_location(self.image_program, "u_tex").as_ref(), 0);
+                let alpha_loc = gl.get_uniform_location(self.image_program, "u_alpha");
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                gl.enable(glow::POLYGON_OFFSET_FILL);
+                gl.polygon_offset(-2.0, -2.0);
+                gl.active_texture(glow::TEXTURE0);
+                for img in &self.images {
+                    gl.uniform_1_f32(alpha_loc.as_ref(), img.alpha);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(img.texture));
+                    gl.bind_vertex_array(Some(img.vao));
+                    gl.draw_arrays(glow::TRIANGLE_FAN, 0, 4);
+                }
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.disable(glow::POLYGON_OFFSET_FILL);
+                gl.disable(glow::BLEND);
+                gl.depth_mask(true);
+            }
             if p.mode == RenderMode::SolidNoEdges {
                 gl.bind_vertex_array(None);
                 gl.use_program(None);
