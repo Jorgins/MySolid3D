@@ -479,6 +479,10 @@ pub struct App {
     selection: Selection,
     hover_face: Option<usize>,
     hover_edge: Option<usize>,
+    /// Идёт вращение или сдвиг вида: дорогие проверки видимости пропускаем, чтобы не тормозить.
+    navigating: bool,
+    /// Среднее время подготовки кадра, мс (показывается внизу окна).
+    frame_ms: f32,
     sketch: Option<SketchEdit>,
     dim_edit: Option<DimEdit>,
     /// Элементы, отмеченные в дереве галочками (для объединения в группу).
@@ -586,6 +590,8 @@ impl App {
             selection: Selection::None,
             hover_face: None,
             hover_edge: None,
+            navigating: false,
+            frame_ms: 0.0,
             sketch: None,
             dim_edit: None,
             checked: Vec::new(),
@@ -1804,6 +1810,7 @@ impl App {
 
         // Выбор граней (только вне эскиза).
         let navigating = resp.dragged();
+        self.navigating = navigating;
         self.hover_face = None;
         self.hover_edge = None;
         if self.sketch.is_none() {
@@ -1811,7 +1818,7 @@ impl App {
                 let (o, d) = self.cam.ray(rect, pos);
                 let hit = self.mesh.pick_hit(o, d);
                 // Ребро рядом с курсором важнее грани под ним.
-                self.hover_edge = self.pick_edge(rect, pos, hit.map(|(_, t)| t));
+                self.hover_edge = self.pick_edge(rect, pos);
                 if self.hover_edge.is_none() {
                     self.hover_face = hit.map(|(face, _)| face);
                 }
@@ -1983,12 +1990,15 @@ impl App {
         }
     }
 
-    /// Видимое ребро в пределах нескольких пикселей от курсора.
-    /// `face_depth` — расстояние вдоль луча до грани под курсором (рёбра за ней считаем скрытыми).
-    fn pick_edge(&self, rect: Rect, pos: Pos2, face_depth: Option<f64>) -> Option<usize> {
-        let (origin, dir) = self.cam.ray(rect, pos);
-        // Допуск по глубине: курсор стоит не точно на ребре, а грань может быть наклонной.
-        let tolerance = 30.0 / self.cam.scale + 0.05;
+    /// Закрыта ли точка тела самой деталью: на пути от неё к глазу есть грань.
+    fn point_hidden(&self, rect: Rect, p: DVec3) -> bool {
+        let dir = self.cam.dir_to_eye(rect, p);
+        // Чуть отступаем от поверхности — точка ребра лежит на ней (сетка приближённая).
+        self.mesh.pick_hit(p + dir * 0.05, dir).is_some()
+    }
+
+    /// Видимое ребро в пределах нескольких пикселей от курсора; скрытые деталью рёбра не выбираются.
+    fn pick_edge(&self, rect: Rect, pos: Pos2) -> Option<usize> {
         let mut best: Option<(f32, usize)> = None;
         for (index, edge) in self.mesh.edges.iter().enumerate() {
             for w in edge.points.windows(2) {
@@ -1997,8 +2007,11 @@ impl App {
                 if dist > 6.0 || best.is_some_and(|(d, _)| d <= dist) {
                     continue;
                 }
-                let depth = ((w[0] + w[1]) * 0.5 - origin).dot(dir);
-                if face_depth.is_some_and(|t| depth > t + tolerance + (w[1] - w[0]).length() * 0.5) {
+                // Ближайшая к курсору точка отрезка — её и проверяем на закрытость.
+                let ab = b - a;
+                let len2 = ab.length_sq();
+                let t = if len2 < 1e-6 { 0.0 } else { ((pos - a).dot(ab) / len2).clamp(0.0, 1.0) } as f64;
+                if self.point_hidden(rect, w[0] + (w[1] - w[0]) * t) {
                     continue;
                 }
                 best = Some((dist, index));
@@ -2007,10 +2020,37 @@ impl App {
         best.map(|(_, index)| index)
     }
 
+    /// Рисует ломаную тела только там, где она видна (скрытые деталью отрезки пропускаются).
+    /// `budget` ограничивает число проверок за кадр; когда он кончился, остальное рисуется целиком.
+    fn draw_visible_polyline(&self, painter: &Painter, rect: Rect, pts: &[DVec3], stroke: Stroke, budget: &mut usize) {
+        let mut run: Vec<Pos2> = Vec::new();
+        for w in pts.windows(2) {
+            let hidden = *budget > 0 && {
+                *budget -= 1;
+                self.point_hidden(rect, (w[0] + w[1]) * 0.5)
+            };
+            if hidden {
+                if run.len() > 1 {
+                    painter.line(std::mem::take(&mut run), stroke);
+                }
+                run.clear();
+                continue;
+            }
+            if run.is_empty() {
+                run.push(self.cam.project(rect, w[0]));
+            }
+            run.push(self.cam.project(rect, w[1]));
+        }
+        if run.len() > 1 {
+            painter.line(run, stroke);
+        }
+    }
+
     fn draw_edge_highlights(&self, painter: &Painter, rect: Rect) {
-        let draw = |index: usize, stroke: Stroke| {
+        let mut budget = if self.navigating { 0 } else { 400 };
+        let mut draw = |index: usize, stroke: Stroke| {
             if let Some(edge) = self.mesh.edges.get(index) {
-                painter.line(edge.points.iter().map(|p| self.cam.project(rect, *p)).collect(), stroke);
+                self.draw_visible_polyline(painter, rect, &edge.points, stroke, &mut budget);
             }
         };
         if let Selection::Edges(list) = &self.selection {
@@ -2030,14 +2070,17 @@ impl App {
             return;
         }
         let stroke = Stroke::new(3.0, ERROR_COLOR);
+        let mut budget = if self.navigating { 0 } else { 400 };
         for feature in self.part.features.iter().filter(|f| f.error.is_some()) {
             match &feature.kind {
                 FeatureKind::Fillet { edges, .. } | FeatureKind::Chamfer { edges, .. } => {
                     for mid in edges {
                         if let Some(edge) = self.mesh.edge_at(*mid).and_then(|i| self.mesh.edges.get(i)) {
-                            painter.line(edge.points.iter().map(|p| self.cam.project(rect, *p)).collect(), stroke);
+                            self.draw_visible_polyline(painter, rect, &edge.points, stroke, &mut budget);
                         }
-                        painter.circle_filled(self.cam.project(rect, *mid), 5.0, ERROR_COLOR);
+                        if self.navigating || !self.point_hidden(rect, *mid) {
+                            painter.circle_filled(self.cam.project(rect, *mid), 5.0, ERROR_COLOR);
+                        }
                     }
                 }
                 FeatureKind::Boss { sketch, .. } | FeatureKind::Cut { sketch, .. } => {
@@ -3078,6 +3121,7 @@ fn draw_dim(
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
         // Ctrl+Z — отмена, Ctrl+Y или Ctrl+Shift+Z — повтор (когда не вводится текст).
         if ui.memory(|m| m.focused().is_none()) {
             use egui::{Key, Modifiers};
@@ -3138,6 +3182,10 @@ impl eframe::App for App {
                     ui.separator();
                     ui.colored_label(SELECT_COLOR, &self.status);
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.weak(format!("кадр: {:.1} мс", self.frame_ms))
+                        .on_hover_text("Время, которое программа тратит на подготовку кадра (без отрисовки видеокартой)");
+                });
             });
         });
         egui::Panel::left("tree").exact_size(240.0).resizable(false).show(ui, |ui| self.tree(ui));
@@ -3153,5 +3201,7 @@ impl eframe::App for App {
         if self.dirty {
             ui.ctx().request_repaint();
         }
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.frame_ms = if self.frame_ms == 0.0 { ms } else { self.frame_ms * 0.9 + ms * 0.1 };
     }
 }

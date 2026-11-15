@@ -2000,6 +2000,10 @@ impl RenderMesh {
                 continue;
             }
             let t = e2.dot(q) / det;
+            // Только впереди начала луча: позади лежащее не «закрывает» точку.
+            if t <= 0.0 {
+                continue;
+            }
             if best.map_or(true, |(bt, _)| t < bt) {
                 let face = self.vertices[tri[0] as usize * 7 + 6] as usize;
                 best = Some((t, face));
@@ -2361,6 +2365,22 @@ mod tests {
         let moved = s.ref_outline(seg);
         assert!(((moved[0] + moved[1]) * 0.5 - DVec2::new(3.0, 9.0)).length() < 1e-9);
         assert!(s.apply_relation(seg, DimRef::Segment(0, 1), Relation::Midpoint).is_err());
+    }
+
+    #[test]
+    fn hidden_edges_are_found_by_ray() {
+        let _kernel = kernel();
+        let (mut part, _) = extruded(rect(0.0, 0.0, 40.0, 30.0), 10.0);
+        part.rebuild(None);
+        let mesh = part.mesh(None);
+        let up = DVec3::Z;
+        let hidden = |p: DVec3| mesh.pick_hit(p + up * 0.05, up).is_some();
+        let front_top = DVec3::new(20.0, 0.0, 10.0);
+        let front_bottom = DVec3::new(20.0, 0.0, 0.0);
+        assert!(mesh.edge_at(front_top).is_some() && mesh.edge_at(front_bottom).is_some());
+        // Смотрим сверху: верхнее ребро видно, нижнее закрыто деталью.
+        assert!(!hidden(front_top));
+        assert!(hidden(front_bottom));
     }
 
     #[test]
