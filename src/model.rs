@@ -1375,14 +1375,52 @@ pub type Rgb = [u8; 3];
 pub const DEFAULT_COLOR: Rgb = [179, 189, 204];
 const SELECTED_FACE: Rgb = [51, 158, 255];
 
-/// Цвет грани. Грань запоминается своим центром — так она находится и после пересчёта тела.
+/// Материал: как поверхность отражает свет.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Material {
+    /// Матовый пластик — обычный вид детали.
+    #[default]
+    Plastic,
+    Metal,
+    Glass,
+    Stone,
+}
+
+impl Material {
+    pub const ALL: [Material; 4] = [Material::Plastic, Material::Metal, Material::Glass, Material::Stone];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Material::Plastic => "Пластик",
+            Material::Metal => "Металл",
+            Material::Glass => "Стекло",
+            Material::Stone => "Камень",
+        }
+    }
+
+    /// Номер материала для шейдера.
+    pub fn id(self) -> f32 {
+        match self {
+            Material::Plastic => 0.0,
+            Material::Metal => 1.0,
+            Material::Glass => 2.0,
+            Material::Stone => 3.0,
+        }
+    }
+}
+
+/// Цвет и материал грани. Грань запоминается своим центром — так она находится и после пересчёта тела.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaceColor {
     pub point: DVec3,
     /// Нормаль грани при покраске (нулевая в старых файлах): после правки цвет ищет грань с той же нормалью.
     #[serde(default)]
     pub normal: DVec3,
-    pub color: Rgb,
+    /// `None` — цвет детали.
+    pub color: Option<Rgb>,
+    /// `None` — материал детали.
+    #[serde(default)]
+    pub material: Option<Material>,
 }
 
 /// Группа элементов в дереве построения. Только для удобства показа: на порядок построения не влияет.
@@ -1414,6 +1452,9 @@ pub struct Part {
     /// Цвета отдельных граней.
     #[serde(default)]
     pub face_colors: Vec<FaceColor>,
+    /// Материал детали целиком.
+    #[serde(default)]
+    pub material: Material,
     #[serde(skip)]
     cache: Cache,
     /// Направления рёбер скруглений и фасок (по номеру элемента): помогают найти те же рёбра,
@@ -1476,20 +1517,52 @@ impl Part {
         self.groups.retain(|g| !g.members.is_empty());
     }
 
-    /// Красит грань с центром `point`; `None` возвращает ей цвет детали.
+    /// Запись о покраске грани с центром `point` вынимается из списка (если она была).
+    fn take_face_entry(&mut self, point: DVec3) -> Option<FaceColor> {
+        let at = self.face_colors.iter().position(|c| (c.point - point).length() <= FACE_MATCH)?;
+        Some(self.face_colors.remove(at))
+    }
+
+    /// Красит грань с центром `point`; `None` возвращает ей цвет детали. Материал грани не меняется.
     pub fn set_face_color(&mut self, point: DVec3, normal: DVec3, color: Option<Rgb>) {
-        self.face_colors.retain(|c| (c.point - point).length() > FACE_MATCH);
-        if let Some(color) = color {
-            self.face_colors.push(FaceColor { point, normal, color });
+        let material = self.take_face_entry(point).and_then(|c| c.material);
+        if color.is_some() || material.is_some() {
+            self.face_colors.push(FaceColor { point, normal, color, material });
         }
     }
 
-    /// Цвет каждой грани сетки, если её красили. Грань после правки размеров сдвигается,
-    /// поэтому цвет достаётся ближайшей грани с той же нормалью, а не только совпавшей по точке.
-    fn painted_faces(&self, mesh: &RenderMesh) -> Vec<Option<Rgb>> {
+    /// Задаёт материал грани с центром `point`; `None` возвращает материал детали. Цвет грани не меняется.
+    pub fn set_face_material(&mut self, point: DVec3, normal: DVec3, material: Option<Material>) {
+        let color = self.take_face_entry(point).and_then(|c| c.color);
+        if color.is_some() || material.is_some() {
+            self.face_colors.push(FaceColor { point, normal, color, material });
+        }
+    }
+
+    /// Красит всю деталь: цвета отдельных граней сбрасываются, материалы граней остаются.
+    pub fn paint_part_color(&mut self, color: Option<Rgb>) {
+        self.color = color;
+        for c in &mut self.face_colors {
+            c.color = None;
+        }
+        self.face_colors.retain(|c| c.material.is_some());
+    }
+
+    /// Материал всей детали: материалы отдельных граней сбрасываются, цвета остаются.
+    pub fn paint_part_material(&mut self, material: Material) {
+        self.material = material;
+        for c in &mut self.face_colors {
+            c.material = None;
+        }
+        self.face_colors.retain(|c| c.color.is_some());
+    }
+
+    /// Запись о покраске каждой грани сетки (номер в `face_colors`). Грань после правки размеров
+    /// сдвигается, поэтому запись достаётся ближайшей грани с той же нормалью, а не только совпавшей по точке.
+    fn painted_faces(&self, mesh: &RenderMesh) -> Vec<Option<usize>> {
         let mut out = vec![None; mesh.faces.len()];
         let reach = mesh.bounds.map_or(FACE_MATCH, |(lo, hi)| ((hi - lo).length() * 0.5).max(FACE_MATCH));
-        for c in &self.face_colors {
+        for (k, c) in self.face_colors.iter().enumerate() {
             let known = c.normal.length_squared() > 0.5;
             let best = mesh
                 .faces
@@ -1500,31 +1573,35 @@ impl Part {
                 .filter(|(_, d)| *d <= reach)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((i, _)) = best {
-                out[i] = Some(c.color);
+                out[i] = Some(k);
             }
         }
         out
     }
 
-    /// Цвета вершин сетки (r, g, b на вершину) с учётом цвета детали и раскрашенных граней.
-    /// Грани из `selected` подкрашиваются цветом выделения.
+    /// Цвета вершин сетки: на вершину r, g, b и номер материала (4 числа). Цвет и материал берутся
+    /// у детали и раскрашенных граней. Грани из `selected` подкрашиваются цветом выделения.
     pub fn vertex_colors(&self, mesh: &RenderMesh, selected: &[usize]) -> Vec<f32> {
         let body = self.color.unwrap_or(DEFAULT_COLOR);
         let painted = self.painted_faces(mesh);
-        let faces: Vec<Rgb> = (0..mesh.faces.len())
+        let faces: Vec<(Rgb, f32)> = (0..mesh.faces.len())
             .map(|i| {
-                let color = painted[i].unwrap_or(body);
-                if selected.contains(&i) {
+                let entry = painted[i].map(|k| &self.face_colors[k]);
+                let color = entry.and_then(|c| c.color).unwrap_or(body);
+                let material = entry.and_then(|c| c.material).unwrap_or(self.material);
+                let color = if selected.contains(&i) {
                     [0, 1, 2].map(|k| ((color[k] as u16 + SELECTED_FACE[k] as u16) / 2) as u8)
                 } else {
                     color
-                }
+                };
+                (color, material.id())
             })
             .collect();
-        let mut out = Vec::with_capacity(mesh.vertices.len() / 7 * 3);
+        let mut out = Vec::with_capacity(mesh.vertices.len() / 7 * 4);
         for v in mesh.vertices.chunks_exact(7) {
-            let color = faces.get(v[6] as usize).copied().unwrap_or(body);
+            let (color, material) = faces.get(v[6] as usize).copied().unwrap_or((body, self.material.id()));
             out.extend(color.map(|c| c as f32 / 255.0));
+            out.push(material);
         }
         out
     }
@@ -2487,15 +2564,45 @@ mod tests {
         part.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, Some([0, 255, 0]));
         assert_eq!(part.face_colors.len(), 1, "повторная покраска заменяет прежнюю");
         let colors = part.vertex_colors(&mesh, &[]);
-        assert_eq!(colors.len(), mesh.vertices.len() / 7 * 3);
-        for (v, c) in mesh.vertices.chunks_exact(7).zip(colors.chunks_exact(3)) {
-            assert_eq!(c, if v[6] as usize == top { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] });
+        assert_eq!(colors.len(), mesh.vertices.len() / 7 * 4);
+        for (v, c) in mesh.vertices.chunks_exact(7).zip(colors.chunks_exact(4)) {
+            assert_eq!(c[..3], if v[6] as usize == top { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] });
         }
         // Цвета сохраняются в файле; сброс возвращает грани цвет детали.
         let mut saved: Part = serde_json::from_str(&serde_json::to_string(&part).unwrap()).unwrap();
-        assert_eq!((saved.color, saved.face_colors[0].color), (Some([255, 0, 0]), [0, 255, 0]));
+        assert_eq!((saved.color, saved.face_colors[0].color), (Some([255, 0, 0]), Some([0, 255, 0])));
         saved.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, None);
-        assert!(saved.vertex_colors(&mesh, &[]).chunks_exact(3).all(|c| c == [1.0, 0.0, 0.0]));
+        assert!(saved.vertex_colors(&mesh, &[]).chunks_exact(4).all(|c| c[..3] == [1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn materials_for_faces_and_part() {
+        let _kernel = kernel();
+        let (mut part, body) = extruded(rect(0.0, 0.0, 40.0, 30.0), 10.0);
+        let mesh = RenderMesh::from_shape(&body.unwrap());
+        let top = mesh.pick(DVec3::new(20.0, 15.0, 100.0), -DVec3::Z).unwrap();
+        let ids = |part: &Part| -> Vec<(usize, f32)> {
+            let colors = part.vertex_colors(&mesh, &[]);
+            mesh.vertices.chunks_exact(7).zip(colors.chunks_exact(4)).map(|(v, c)| (v[6] as usize, c[3])).collect()
+        };
+        // Металл на одной грани не трогает остальные и не мешает цвету.
+        part.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, Some([255, 0, 0]));
+        part.set_face_material(mesh.faces[top].origin, mesh.faces[top].normal, Some(Material::Metal));
+        assert_eq!(part.face_colors.len(), 1);
+        assert!(ids(&part).iter().all(|&(f, m)| m == if f == top { 1.0 } else { 0.0 }));
+        // Перекраска грани не сбрасывает её материал.
+        part.set_face_color(mesh.faces[top].origin, mesh.faces[top].normal, Some([0, 255, 0]));
+        assert_eq!(part.face_colors[0].material, Some(Material::Metal));
+        // Файл хранит материалы.
+        let saved: Part = serde_json::from_str(&serde_json::to_string(&part).unwrap()).unwrap();
+        assert_eq!(saved.face_colors[0].material, Some(Material::Metal));
+        // Материал всей детали заменяет материалы граней, а их цвета остаются.
+        part.paint_part_material(Material::Glass);
+        assert!(ids(&part).iter().all(|&(_, m)| m == 2.0));
+        assert_eq!(part.face_colors.len(), 1);
+        // Цвет всей детали убирает цвета граней.
+        part.paint_part_color(Some([1, 2, 3]));
+        assert!(part.face_colors.is_empty());
     }
 
     #[test]
@@ -2513,7 +2620,7 @@ mod tests {
         let top = mesh.pick(DVec3::new(35.0, 15.0, 100.0), -DVec3::Z).unwrap();
         let colors = part.vertex_colors(&mesh, &[]);
         let v = mesh.vertices.chunks_exact(7).position(|v| v[6] as usize == top).unwrap();
-        assert_eq!(&colors[v * 3..v * 3 + 3], [0.0, 0.0, 1.0]);
+        assert_eq!(&colors[v * 4..v * 4 + 3], [0.0, 0.0, 1.0]);
     }
 
     #[test]

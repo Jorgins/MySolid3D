@@ -2,7 +2,7 @@
 
 use crate::camera::Camera;
 use crate::model::{
-    bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Part, PathPoint, Plane, Relation,
+    bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Material, Part, PathPoint, Plane, Relation,
     RenderMesh, Sketch, SketchImage, SketchShape, TreeItem, MIN_SIZE,
 };
 use crate::render::{DrawParams, RenderMode, Renderer};
@@ -1914,6 +1914,8 @@ impl App {
         }
         let part_mode = self.paint_part;
         let mut pick: Option<Option<[u8; 3]>> = None;
+        let mut pick_material: Option<Material> = None;
+        let mut first_swatch_x = 0.0f32;
         let mut mode = part_mode;
         egui::Area::new(egui::Id::unique("color_palette")).fixed_pos(rect.left_top() + Vec2::splat(8.0)).show(
             ui.ctx(),
@@ -1932,6 +1934,7 @@ impl App {
                             mode = true;
                         }
                         ui.separator();
+                        first_swatch_x = ui.next_widget_position().x;
                         for c in PALETTE {
                             if swatch(ui, c) {
                                 pick = Some(Some(c));
@@ -1951,19 +1954,32 @@ impl App {
                         }
                     });
                     if self.palette_open {
-                        // Раскладушка: между каждой парой соседних цветов — три промежуточных оттенка.
-                        for t in [0.25f32, 0.5, 0.75] {
-                            ui.horizontal(|ui| {
-                                for pair in PALETTE.windows(2) {
-                                    let mix = |k: usize| (pair[0][k] as f32 * (1.0 - t) + pair[1][k] as f32 * t).round() as u8;
-                                    let c = [mix(0), mix(1), mix(2)];
-                                    if swatch(ui, c) {
-                                        pick = Some(Some(c));
-                                    }
+                        // Раскладушка: ряд ниже, и под щелью между двумя соседними цветами — их середина.
+                        ui.horizontal(|ui| {
+                            let half = (16.0 + ui.spacing().item_spacing.x) / 2.0;
+                            ui.add_space(first_swatch_x - ui.next_widget_position().x + half);
+                            for pair in PALETTE.windows(2) {
+                                let mix = |k: usize| ((pair[0][k] as u16 + pair[1][k] as u16 + 1) / 2) as u8;
+                                if swatch(ui, [mix(0), mix(1), mix(2)]) {
+                                    pick = Some(Some([mix(0), mix(1), mix(2)]));
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
+                    ui.horizontal(|ui| {
+                        ui.weak("Материал:");
+                        for m in Material::ALL {
+                            let tip = match m {
+                                Material::Plastic => "Матовый пластик (по умолчанию)",
+                                Material::Metal => "Блестящий металл: цвет — оттенок металла",
+                                Material::Glass => "Прозрачное стекло: цвет — оттенок стекла",
+                                Material::Stone => "Матовый камень с крапом: цвет — оттенок камня",
+                            };
+                            if ui.button(m.name()).on_hover_text(tip).clicked() {
+                                pick_material = Some(m);
+                            }
+                        }
+                    });
                     if !part_mode && faces.is_empty() {
                         ui.colored_label(SELECT_COLOR, "Щёлкните по грани детали, которую нужно покрасить");
                     }
@@ -1971,11 +1987,24 @@ impl App {
             },
         );
         self.paint_part = mode;
-        if let Some(color) = pick {
+        if let Some(material) = pick_material {
             if part_mode {
-                self.part.color = color;
+                self.part.paint_part_material(material);
+            } else if faces.is_empty() {
+                self.status = "Сначала выберите грань (Ctrl+щелчок — несколько) или переключитесь на «Деталь»".into();
+            } else {
+                // «Пластик» у грани — это материал детали, а не отдельная запись.
+                let own = (material != self.part.material).then_some(material);
+                for (point, normal) in faces {
+                    self.part.set_face_material(point, normal, own);
+                }
+                self.selection = Selection::None;
+            }
+            self.colors_dirty = true;
+        } else if let Some(color) = pick {
+            if part_mode {
                 // Красим весь объект — прежние цвета отдельных граней больше не нужны.
-                self.part.face_colors.clear();
+                self.part.paint_part_color(color);
             } else if faces.is_empty() {
                 self.status = "Сначала выберите грань (Ctrl+щелчок — несколько) или переключитесь на «Деталь»".into();
             } else {
