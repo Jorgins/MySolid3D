@@ -175,6 +175,54 @@ fn swatch(ui: &mut egui::Ui, c: [u8; 3]) -> bool {
     resp.clicked()
 }
 
+/// Характерные точки фигуры, к которым можно привязаться: углы, середины сторон, центры.
+fn shape_snap_points(s: &SketchShape) -> Vec<DVec2> {
+    match s {
+        SketchShape::Rect { x, y, w, h } => {
+            let (x, y, w, h) = (*x, *y, *w, *h);
+            [
+                (x, y),
+                (x + w, y),
+                (x + w, y + h),
+                (x, y + h),
+                (x + w / 2.0, y),
+                (x + w, y + h / 2.0),
+                (x + w / 2.0, y + h),
+                (x, y + h / 2.0),
+                (x + w / 2.0, y + h / 2.0),
+            ]
+            .iter()
+            .map(|&(a, b)| DVec2::new(a, b))
+            .collect()
+        }
+        SketchShape::Circle { cx, cy, r } => {
+            let c = DVec2::new(*cx, *cy);
+            vec![c, c + DVec2::new(*r, 0.0), c - DVec2::new(*r, 0.0), c + DVec2::new(0.0, *r), c - DVec2::new(0.0, *r)]
+        }
+        SketchShape::Path { points, closed } => {
+            let n = points.len();
+            let mut out = Vec::new();
+            for i in 0..n {
+                out.push(points[i].pos());
+                if (i + 1 < n || *closed) && points[i].bulge == 0.0 {
+                    out.push((points[i].pos() + points[(i + 1) % n].pos()) * 0.5);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Точки и линии эскиза для привязки; `skip` — фигура, которую сейчас переносят.
+fn sketch_snap_targets(sketch: &Sketch, skip: Option<usize>) -> (Vec<DVec2>, Vec<Vec<DVec2>>) {
+    let (mut points, mut lines) = (Vec::new(), Vec::new());
+    for (_, shape) in sketch.shapes.iter().enumerate().filter(|(i, _)| Some(*i) != skip) {
+        points.extend(shape_snap_points(shape));
+        lines.push(shape.outline());
+    }
+    (points, lines)
+}
+
 /// Красный крестик в правом верхнем углу вида: выйти из эскиза.
 fn exit_button(ui: &egui::Ui, rect: Rect) -> bool {
     let mut clicked = false;
@@ -426,6 +474,8 @@ pub struct App {
     /// Цвета изменились — их нужно заново передать в видеокарту.
     colors_dirty: bool,
     snap: bool,
+    /// Привязка к точкам и линиям: текущего эскиза, более ранних эскизов и самого тела.
+    snap_objects: bool,
     grid_step: f64,
     status: String,
     need_fit: bool,
@@ -525,6 +575,7 @@ impl App {
             recent: load_recent(),
             colors_dirty: false,
             snap: true,
+            snap_objects: true,
             grid_step: 1.0,
             status: String::new(),
             need_fit: false,
@@ -1096,6 +1147,8 @@ impl App {
         ).clicked() || add_image;
         ui.separator();
         ui.checkbox(&mut self.snap, "Привязка к сетке");
+        ui.checkbox(&mut self.snap_objects, "Привязка к объектам")
+            .on_hover_text("К точкам и линиям этого и более ранних эскизов, к рёбрам и вершинам тела");
         ui.add(egui::DragValue::new(&mut self.grid_step).speed(0.1).range(0.1..=100.0).suffix(" мм"))
             .on_hover_text("Шаг сетки");
         if add_image {
@@ -2062,6 +2115,30 @@ impl App {
         }
     }
 
+    /// Что видно в плоскости эскиза `id` и подходит для привязки, кроме него самого: начало координат,
+    /// более ранние эскизы и рёбра тела (всё проецируется на плоскость эскиза, как и на экране).
+    fn snap_targets(&self, id: u64, plane: &Plane) -> (Vec<DVec2>, Vec<Vec<DVec2>>) {
+        let (mut points, mut lines) = (vec![DVec2::ZERO], Vec::new());
+        for feature in &self.part.features {
+            if feature.id == id {
+                break;
+            }
+            let FeatureKind::Sketch(other) = &feature.kind else { continue };
+            let local = |p: DVec2| plane.to_local(other.plane.to_world(p));
+            for shape in &other.shapes {
+                points.extend(shape_snap_points(shape).into_iter().map(local));
+                lines.push(shape.outline().into_iter().map(local).collect());
+            }
+        }
+        for edge in &self.mesh.edges {
+            if let (Some(a), Some(b)) = (edge.points.first(), edge.points.last()) {
+                points.extend([plane.to_local(*a), plane.to_local(*b), plane.to_local(edge.mid)]);
+            }
+            lines.push(edge.points.iter().map(|p| plane.to_local(*p)).collect());
+        }
+        (points, lines)
+    }
+
     /// Режим эскиза: рисование фигур, перенос, размеры.
     fn sketch_mode(&mut self, ui: &egui::Ui, resp: &Response, painter: &Painter, rect: Rect, edit: &mut SketchEdit) {
         let Some(plane) = self.part.sketch(edit.id).map(|s| s.plane) else { return };
@@ -2070,7 +2147,42 @@ impl App {
 
         let cam = self.cam.clone();
         let (snap, step) = (self.snap, self.grid_step.max(0.1));
-        let snap_pt = |p: DVec2| if snap { (p / step).round() * step } else { p };
+        // Привязка к объектам: сначала к точкам, потом к линиям; без неё — к сетке.
+        let (extra_points, extra_lines) =
+            if self.snap_objects { self.snap_targets(edit.id, &plane) } else { Default::default() };
+        let skip = if edit.tool == Tool::Select { edit.selected } else { None };
+        let (own_points, own_lines) = match (self.snap_objects, self.part.sketch(edit.id)) {
+            (true, Some(sketch)) => sketch_snap_targets(sketch, skip),
+            _ => Default::default(),
+        };
+        let reach = 10.0 / cam.scale;
+        let nearest_object = |raw: DVec2| -> Option<DVec2> {
+            let mut best: Option<(f64, DVec2)> = None;
+            for q in extra_points.iter().chain(&own_points) {
+                let d = (*q - raw).length();
+                if d < reach && best.is_none_or(|(b, _)| d < b) {
+                    best = Some((d, *q));
+                }
+            }
+            if best.is_none() {
+                for line in extra_lines.iter().chain(&own_lines) {
+                    for w in line.windows(2) {
+                        let ab = w[1] - w[0];
+                        let len2 = ab.length_squared();
+                        let t = if len2 < 1e-12 { 0.0 } else { ((raw - w[0]).dot(ab) / len2).clamp(0.0, 1.0) };
+                        let q = w[0] + ab * t;
+                        let d = (q - raw).length();
+                        if d < reach * 0.7 && best.is_none_or(|(b, _)| d < b) {
+                            best = Some((d, q));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, q)| q)
+        };
+        let snap_pt = |p: DVec2| {
+            nearest_object(p).unwrap_or_else(|| if snap { (p / step).round() * step } else { p })
+        };
         let raw_at = |pos: Pos2| cam.screen_to_plane(rect, pos, &plane);
         let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
         let press = ui.input(|i| i.pointer.press_origin());
@@ -2322,6 +2434,14 @@ impl App {
             painter.text(at, Align2::LEFT_TOP, text, FontId::proportional(13.0), Color32::from_gray(200));
         }
 
+        // Маркер привязки к объекту под курсором.
+        if matches!(edit.tool, Tool::Line | Tool::Arc | Tool::Rect | Tool::Circle) {
+            if let Some(q) = pointer.and_then(raw_at).and_then(nearest_object) {
+                let c = cam.project(rect, plane.to_world(q));
+                let stroke = Stroke::new(2.0, Color32::from_rgb(255, 210, 60));
+                painter.rect_stroke(Rect::from_center_size(c, Vec2::splat(10.0)), 0.0, stroke, egui::StrokeKind::Middle);
+            }
+        }
         // Щелчок по подписи размера — правка значения.
         let dim_tool = edit.tool == Tool::Dimension;
         let mut request: Option<(Dim, Option<usize>, Pos2)> = None;
