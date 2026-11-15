@@ -2,7 +2,7 @@
 
 use crate::camera::Camera;
 use crate::model::{
-    bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Material, Part, PathPoint, Plane, Relation,
+    bulge_through, segment_points, Dim, DimMode, DimRef, FeatureKind, Material, Part, PathPoint, Plane,
     RenderMesh, Sketch, SketchImage, SketchShape, TreeItem, MIN_SIZE,
 };
 use crate::render::{DrawParams, RenderMode, Renderer};
@@ -57,6 +57,15 @@ enum Tool {
     Dimension,
 }
 
+/// Элемент `r` ещё существует в эскизе (фигуру или точку могли удалить).
+fn sketch_ref_exists(sketch: &Sketch, r: DimRef) -> bool {
+    match r {
+        DimRef::Origin => true,
+        DimRef::Point(s, i) => sketch.shapes.get(s).is_some_and(|s| i < s.points().len()),
+        _ => false,
+    }
+}
+
 /// Что делает мышь с картинкой-подложкой.
 #[derive(Clone, Copy)]
 enum ImageDrag {
@@ -91,6 +100,8 @@ struct SketchEdit {
     /// Картинка-подложка выбрана (видны угловые маркеры) и что с ней делает мышь.
     image_sel: bool,
     image_drag: Option<ImageDrag>,
+    /// Точки (и начало координат), выбранные стрелкой для связи: до двух.
+    points_sel: Vec<DimRef>,
     /// Отрезок, по которому щёлкнули правой кнопкой: (фигура, сегмент).
     line_menu: Option<(usize, usize)>,
     /// Открытое окно операции над выбранной фигурой и введённые в нём параметры.
@@ -115,6 +126,7 @@ impl SketchEdit {
             drag_label: None,
             image_sel: false,
             image_drag: None,
+            points_sel: Vec::new(),
             line_menu: None,
             op: None,
             params: OpParams::default(),
@@ -2639,6 +2651,23 @@ impl App {
                         }
                     }
                 }
+                // Щелчок по точке контура или по началу координат отмечает её для связи (до двух точек).
+                if clicked && !dragging_vertex {
+                    let hit = pointer
+                        .and_then(raw_at)
+                        .and_then(|p| sketch.pick_ref(p, 8.0 * px))
+                        .filter(|r| matches!(r, DimRef::Point(..) | DimRef::Origin));
+                    match hit {
+                        Some(r) if edit.points_sel.contains(&r) => edit.points_sel.retain(|x| *x != r),
+                        Some(r) => {
+                            if edit.points_sel.len() >= 2 {
+                                edit.points_sel.clear();
+                            }
+                            edit.points_sel.push(r);
+                        }
+                        None => edit.points_sel.clear(),
+                    }
+                }
                 // Пока тянут картинку, фигуры не трогаем.
                 dragging_vertex |= edit.image_drag.is_some();
                 if dragging_vertex {
@@ -2755,6 +2784,52 @@ impl App {
             for c in corners {
                 painter.rect_filled(Rect::from_center_size(c, Vec2::splat(9.0)), 1.0, SELECT_COLOR);
             }
+        }
+        // Точки, выбранные стрелкой: кольца и панель со связями между ними.
+        edit.points_sel.retain(|r| sketch_ref_exists(sketch, *r));
+        for r in &edit.points_sel {
+            let q = match r {
+                DimRef::Origin => Some(DVec2::ZERO),
+                DimRef::Point(si, pi) => sketch.shapes.get(*si).and_then(|s| s.points().get(*pi).copied()),
+                _ => None,
+            };
+            if let Some(q) = q {
+                painter.circle_stroke(cam.project(rect, plane.to_world(q)), 8.0, Stroke::new(2.0, SELECT_COLOR));
+            }
+        }
+        let mut point_relation = None;
+        if edit.tool == Tool::Select && !edit.points_sel.is_empty() {
+            // Начало координат неподвижно, поэтому оно всегда «первое»: к нему подтягивается вторая точка.
+            let mut pair = edit.points_sel.clone();
+            if pair.len() == 2 && pair[1] == DimRef::Origin {
+                pair.swap(0, 1);
+            }
+            egui::Area::new(egui::Id::unique("point_relations"))
+                .fixed_pos(rect.center_top() + Vec2::new(-150.0, 10.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let [a, b] = pair[..] {
+                                for r in sketch.relations(a, b) {
+                                    if ui.button(r.name()).clicked() {
+                                        point_relation = Some((a, b, r));
+                                    }
+                                }
+                            } else {
+                                ui.weak("Выберите вторую точку (или начало координат) для связи");
+                            }
+                            if ui.small_button("✕").on_hover_text("Снять выбор точек").clicked() {
+                                edit.points_sel.clear();
+                            }
+                        });
+                    });
+                });
+        }
+        if let Some((a, b, r)) = point_relation {
+            if let Err(e) = sketch.apply_relation(a, b, r) {
+                self.status = e;
+            }
+            edit.points_sel.clear();
         }
         sketch.prune_dim_places();
         let mut labels = Vec::new();
@@ -2994,14 +3069,7 @@ impl App {
                         if !relations.is_empty() {
                             ui.horizontal(|ui| {
                                 for &r in &relations {
-                                    let name = match r {
-                                        Relation::Parallel => "Параллельно",
-                                        Relation::Perpendicular => "Перпендикулярно",
-                                        Relation::Collinear => "Коллинеарно",
-                                        Relation::Coincident => "Совпадение",
-                                        Relation::Midpoint => "Середина отрезка",
-                                    };
-                                    if ui.button(name).clicked() {
+                                    if ui.button(r.name()).clicked() {
                                         relation = Some(r);
                                     }
                                 }

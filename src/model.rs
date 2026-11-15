@@ -672,6 +672,24 @@ pub enum Relation {
     Coincident,
     /// Точка в середине отрезка.
     Midpoint,
+    /// Две точки на одной горизонтали (одинаковая Y).
+    Horizontal,
+    /// Две точки на одной вертикали (одинаковая X).
+    Vertical,
+}
+
+impl Relation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Relation::Parallel => "Параллельно",
+            Relation::Perpendicular => "Перпендикулярно",
+            Relation::Collinear => "Коллинеарно",
+            Relation::Coincident => "Совпадение",
+            Relation::Midpoint => "Середина отрезка",
+            Relation::Horizontal => "Горизонтально",
+            Relation::Vertical => "Вертикально",
+        }
+    }
 }
 
 /// Точка или прямая, которую задаёт элемент, — для размеров-расстояний.
@@ -1077,7 +1095,9 @@ impl Sketch {
             (Some(RefGeom::Point(_)), Some(RefGeom::Line(..))) | (Some(RefGeom::Line(..)), Some(RefGeom::Point(_))) => {
                 vec![Relation::Coincident, Relation::Midpoint]
             }
-            (Some(_), Some(_)) => vec![Relation::Coincident],
+            (Some(RefGeom::Point(_)), Some(RefGeom::Point(_))) => {
+                vec![Relation::Coincident, Relation::Horizontal, Relation::Vertical]
+            }
             _ => vec![],
         }
     }
@@ -1086,6 +1106,9 @@ impl Sketch {
         match relation {
             Relation::Coincident => self.set_dim(&Dim::Distance(a, b, DimMode::Aligned), 0.0),
             Relation::Perpendicular => self.set_dim(&Dim::Angle(a, b), 90.0),
+            // Одинаковая Y (по вертикали расстояние ноль) и одинаковая X.
+            Relation::Horizontal => self.set_dim(&Dim::Distance(a, b, DimMode::Vertical), 0.0),
+            Relation::Vertical => self.set_dim(&Dim::Distance(a, b, DimMode::Horizontal), 0.0),
             Relation::Midpoint => match (self.ref_geom(a), self.ref_geom(b)) {
                 // Первый элемент остаётся на месте: точка идёт к середине отрезка, а отрезок — к точке.
                 (Some(RefGeom::Line(p, q)), Some(RefGeom::Point(pt))) => self.move_ref(b, a, (p + q) * 0.5 - pt),
@@ -2434,7 +2457,7 @@ mod tests {
         // Совпадение: центр окружности — в вершину контура, точка — на отрезок.
         let mut s = sketch(vec![l_shape(), SketchShape::Circle { cx: 50.0, cy: 40.0, r: 2.0 }]);
         let Dim::Distance(a, b, _) = s.pair_dim(DimRef::Point(0, 2), DimRef::Circle(1)).unwrap() else { panic!() };
-        assert_eq!(s.relations(a, b), vec![Relation::Coincident]);
+        assert_eq!(s.relations(a, b), vec![Relation::Coincident, Relation::Horizontal, Relation::Vertical]);
         s.apply_relation(a, b, Relation::Coincident).unwrap();
         assert!(close(s.shapes[1].points()[0], 30.0, 10.0));
         s.apply_relation(DimRef::Segment(0, 5), DimRef::Point(1, 0), Relation::Coincident).unwrap();
@@ -2642,6 +2665,22 @@ mod tests {
         let body = part.rebuild(None);
         assert!(part.features[1].error.is_none(), "{:?}", part.features[1].error);
         assert!(body.is_some());
+    }
+
+    #[test]
+    fn points_horizontal_vertical_and_origin() {
+        let mut s = Sketch::new(Plane::TOP, vec![path(&[(5.0, 3.0, 0.0), (30.0, 10.0, 0.0), (50.0, 40.0, 0.0)], false)]);
+        let (a, b, c) = (DimRef::Point(0, 0), DimRef::Point(0, 1), DimRef::Point(0, 2));
+        assert_eq!(s.relations(a, b), vec![Relation::Coincident, Relation::Horizontal, Relation::Vertical]);
+        s.apply_relation(b, c, Relation::Horizontal).unwrap();
+        assert!((s.shapes[0].points()[2].y - 10.0).abs() < 1e-9);
+        s.apply_relation(b, a, Relation::Vertical).unwrap();
+        assert!((s.shapes[0].points()[0].x - 30.0).abs() < 1e-9);
+        // Начало координат неподвижно: к нему подтягивается точка.
+        s.apply_relation(DimRef::Origin, b, Relation::Vertical).unwrap();
+        assert!(s.shapes[0].points()[1].x.abs() < 1e-9);
+        s.apply_relation(DimRef::Origin, b, Relation::Coincident).unwrap();
+        assert!(s.shapes[0].points()[1].length() < 1e-9);
     }
 
     #[test]
