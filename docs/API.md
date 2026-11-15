@@ -83,7 +83,7 @@ MySolid3D — параметрический CAD (эскизы → бобышк�
 | `edges` | — | `edges[]`: `index`, `mid`, `start`, `end`, `length`, `straight`, `closed` |
 | `help` | — | список команд |
 
-`body`: `has_body`, `min`, `max`, `size` ([x,y,z] габариты), `faces`, `edges` — счётчики. **Номера граней и рёбер
+`body`: `has_body`, `min`, `max`, `size` ([x,y,z] габариты), `volume` (мм³, по сетке — для проверки, что детали не пересекаются), `faces`, `edges` — счётчики. **Номера граней и рёбер
 меняются после любой операции**, поэтому перед `fillet`/`chamfer`/`color` по граням/`add_sketch` по грани
 запрашивайте `faces`/`edges` заново.
 

@@ -341,9 +341,22 @@ impl App {
             Some((lo, hi)) => json!({
                 "has_body": true, "min": j3(lo), "max": j3(hi), "size": j3(hi - lo),
                 "faces": self.mesh.faces.len(), "edges": self.mesh.edges.len(),
+                "volume": round6(self.mesh_volume()),
             }),
             None => json!({"has_body": false}),
         }
+    }
+
+    /// Объём тела в мм³ по сетке показа (у криволинейных поверхностей — приближённо, ошибка порядка десятых долей процента).
+    fn mesh_volume(&self) -> f64 {
+        let v = &self.mesh.vertices;
+        let at = |k: u32| {
+            let o = k as usize * 7;
+            DVec3::new(v[o] as f64, v[o + 1] as f64, v[o + 2] as f64)
+        };
+        let total: f64 =
+            self.mesh.indices.chunks_exact(3).map(|t| at(t[0]).dot(at(t[1]).cross(at(t[2]))) / 6.0).sum();
+        total.abs()
     }
 
     fn api_sketch_mut(&mut self, v: &Value) -> Result<&mut crate::model::Sketch, String> {
