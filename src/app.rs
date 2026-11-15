@@ -1891,6 +1891,21 @@ impl App {
             }
             Selection::Edges(ref list) => {
                 ui.label(format!("Выбрано рёбер: {}", list.len()));
+                // Длина каждого выбранного ребра (у кривых — по ломаной, чуть меньше настоящей).
+                let lengths: Vec<f64> = list
+                    .iter()
+                    .filter_map(|&i| self.mesh.edges.get(i))
+                    .map(|e| e.points.windows(2).map(|w| (w[1] - w[0]).length()).sum())
+                    .collect();
+                for (k, len) in lengths.iter().enumerate().take(12) {
+                    ui.label(format!("Ребро {}: длина {} мм", k + 1, fmt_mm(*len)));
+                }
+                if lengths.len() > 12 {
+                    ui.weak(format!("… и ещё {}", lengths.len() - 12));
+                }
+                if lengths.len() > 1 {
+                    ui.strong(format!("Сумма длин: {} мм", fmt_mm(lengths.iter().sum())));
+                }
                 ui.weak("Ctrl+щелчок — добавить или убрать ребро.");
                 ui.add_space(4.0);
                 let fillet = ui.button("Скругление").clicked();
