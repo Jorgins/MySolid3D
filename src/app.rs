@@ -506,6 +506,9 @@ pub struct App {
     had_faces: bool,
     /// Открыт вопрос «сохранить под текущим названием или как…».
     ask_save: bool,
+    /// Окно закрытия программы с несохранёнными изменениями: показан вопрос; закрытие разрешено.
+    ask_exit: bool,
+    allow_close: bool,
     /// Раскрыта ли раскладушка с переходными цветами.
     palette_open: bool,
     /// Файл, в который сохраняется деталь (Ctrl+S), и её состояние в момент сохранения.
@@ -595,6 +598,8 @@ impl App {
             paint_part: true,
             had_faces: false,
             ask_save: false,
+            ask_exit: false,
+            allow_close: false,
             palette_open: false,
             file: None,
             saved_json: String::new(),
@@ -871,6 +876,52 @@ impl App {
             self.ask_save = true;
         } else {
             self.save_as();
+        }
+    }
+
+    /// Вопрос при закрытии программы, если есть несохранённые изменения.
+    fn exit_question(&mut self, ctx: &egui::Context) {
+        if !self.ask_exit {
+            return;
+        }
+        let name = self
+            .file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or("новая деталь".into(), |n| n.to_string_lossy().into_owned());
+        let (mut save, mut discard, mut cancel) = (false, false, false);
+        egui::Window::new("Закрытие программы")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("В детали «{name}» есть несохранённые изменения."));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save = ui.button("Сохранить и выйти").clicked();
+                    discard = ui.button("Выйти без сохранения").clicked();
+                    cancel = ui.button("Отмена").clicked();
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if save {
+            match self.file.clone() {
+                Some(path) => self.write_to(&path),
+                None => self.save_as(),
+            }
+            // Закрываем, только если файл действительно записан (диалог могли отменить).
+            if serde_json::to_string(&self.part).is_ok_and(|json| json == self.saved_json) {
+                discard = true;
+            }
+        }
+        if discard {
+            self.allow_close = true;
+            self.ask_exit = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel {
+            self.ask_exit = false;
         }
     }
 
@@ -2941,6 +2992,10 @@ impl eframe::App for App {
             .as_ref()
             .and_then(|p| p.file_name())
             .map_or("новая деталь".into(), |n| n.to_string_lossy().into_owned());
+        if ui.ctx().input(|i| i.viewport().close_requested()) && modified && !self.allow_close {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ask_exit = true;
+        }
         let title = format!("MySolid3D — {name}{}", if modified { " *" } else { "" });
         if title != self.title {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2986,6 +3041,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
         self.sketch_op_window(ui.ctx());
         self.save_question(ui.ctx());
+        self.exit_question(ui.ctx());
         self.track_history(ui.ctx());
 
         if self.dirty {
