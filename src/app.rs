@@ -76,7 +76,9 @@ struct SketchEdit {
     /// выбирается положением курсора, щелчок фиксирует его и открывает ввод значения.
     placing: Option<Dim>,
     /// Области подписей размеров на прошлом кадре: щелчок по ним не должен попадать в инструмент.
-    labels: Vec<Rect>,
+    labels: Vec<(Rect, usize)>,
+    /// Размер (номер в `Sketch::dims`), который сейчас перетаскивают за подпись.
+    drag_label: Option<usize>,
     /// Открытое окно операции над выбранной фигурой и введённые в нём параметры.
     op: Option<OpKind>,
     params: OpParams,
@@ -96,6 +98,7 @@ impl SketchEdit {
             dim_first: None,
             placing: None,
             labels: Vec::new(),
+            drag_label: None,
             op: None,
             params: OpParams::default(),
         }
@@ -2243,13 +2246,29 @@ impl App {
         let px = 1.0 / cam.scale; // миллиметров в одном пикселе
         let no_focus = ui.memory(|m| m.focused().is_none());
         // Щелчок по подписи размера открывает ввод значения и инструменту не передаётся.
-        let on_label = resp.hover_pos().is_some_and(|p| edit.labels.iter().any(|r| r.expand(4.0).contains(p)));
+        let on_label = resp.hover_pos().is_some_and(|p| edit.labels.iter().any(|(r, _)| r.expand(4.0).contains(p)));
         let clicked = resp.clicked() && !on_label;
         if on_label {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
         let Some(sketch) = self.part.sketch_mut(edit.id) else { return };
+        // Размер можно перетащить за подпись: размерная линия идёт за курсором.
+        if resp.drag_started_by(primary) {
+            edit.drag_label =
+                press.and_then(|p| edit.labels.iter().find(|(r, _)| r.expand(4.0).contains(p)).map(|(_, i)| *i));
+        }
+        if let Some(i) = edit.drag_label {
+            if let (Some(p), Some(dim)) = (pointer.and_then(raw_at), sketch.dims.get(i).copied()) {
+                if resp.dragged_by(primary) {
+                    sketch.set_dim_place(dim, p);
+                }
+            }
+            if resp.drag_stopped_by(primary) || !resp.dragged_by(primary) {
+                edit.drag_label = None;
+            }
+        }
+        let dragging_label = edit.drag_label.is_some();
         let mut preview = None;
         // Предпросмотр следующего сегмента контура (в координатах эскиза).
         let mut chain_preview: Option<Vec<DVec2>> = None;
@@ -2294,7 +2313,8 @@ impl App {
             }
         }
 
-        match edit.tool {
+        // Пока тащат подпись размера, инструменты рисования не работают.
+        match if dragging_label { Tool::Dimension } else { edit.tool } {
             Tool::Line | Tool::Arc => {
                 let ends = |sketch: &Sketch, chain: usize| match sketch.shapes.get(chain) {
                     Some(SketchShape::Path { points, .. }) if !points.is_empty() => {
@@ -2499,7 +2519,7 @@ impl App {
         // Щелчок по подписи размера — правка значения.
         let dim_tool = edit.tool == Tool::Dimension;
         let mut request: Option<(Dim, Option<usize>, Pos2)> = None;
-        edit.labels = labels.iter().map(|l| l.rect).collect();
+        edit.labels = labels.iter().map(|l| (l.rect, l.index)).collect();
         if resp.clicked() {
             if let Some(l) = pointer.and_then(|p| labels.iter().find(|l| l.rect.expand(4.0).contains(p))) {
                 request = Some((l.dim, Some(l.index), l.rect.left_top() - Vec2::new(8.0, 6.0)));
