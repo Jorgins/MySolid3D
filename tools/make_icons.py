@@ -86,6 +86,16 @@ drawn('line', line_icon)
 drawn('rect', rect_icon)
 drawn('circle', circle_icon)
 
+# 3б. «Сохранить как»: значок «сохранить» с карандашом в правом нижнем углу.
+save_as = Image.open('%s/save_file.png' % OUT).convert('RGBA')
+badge = Image.new('RGBA', (SIZE * K, SIZE * K), (0, 0, 0, 0))
+bd = ImageDraw.Draw(badge)
+bd.ellipse((int(33 * K), int(33 * K), int(63 * K), int(63 * K)), fill=(18, 24, 36, 255), outline=DOT, width=int(2 * K))
+bd.line((int(41 * K), int(55 * K), int(55 * K), int(41 * K)), fill=(255, 255, 255, 255), width=int(5 * K))
+bd.polygon([(int(38 * K), int(58 * K)), (int(40 * K), int(52 * K)), (int(44 * K), int(56 * K))], fill=DOT)
+save_as.alpha_composite(badge.resize((SIZE, SIZE), Image.LANCZOS))
+save_as.save('%s/save_as.png' % OUT)
+
 # 4. Иконка приложения.
 Image.open('in/05_axis_cube.png').convert('RGBA').resize((256, 256), Image.LANCZOS).save('assets/app_icon.png')
 

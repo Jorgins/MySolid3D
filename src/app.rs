@@ -160,7 +160,7 @@ macro_rules! icons {
 icons!(
     arc, chamfer, circle, copy, corner_chamfer, corner_fillet, delete, dimension, extrude_boss, extrude_cut,
     fillet, fit_view, line, materials, mirror, new_file, offset, open_file, pattern_circle, pattern_grid, rect,
-    redo, rotate, save_file, scale, select, sketch, solid_view, undo, view_front, view_iso, view_right, view_top,
+    redo, rotate, save_as, save_file, scale, select, sketch, solid_view, undo, view_front, view_iso, view_right, view_top,
     wireframe, zoom_in, zoom_out,
 );
 
@@ -521,8 +521,6 @@ pub struct App {
     /// Что красит палитра: всю деталь (иначе выбранные грани).
     paint_part: bool,
     had_faces: bool,
-    /// Открыт вопрос «сохранить под текущим названием или как…».
-    ask_save: bool,
     /// Окно закрытия программы с несохранёнными изменениями: показан вопрос; закрытие разрешено.
     ask_exit: bool,
     allow_close: bool,
@@ -616,7 +614,6 @@ impl App {
             face_hl: Vec::new(),
             paint_part: true,
             had_faces: false,
-            ask_save: false,
             ask_exit: false,
             allow_close: false,
             palette_open: false,
@@ -889,12 +886,11 @@ impl App {
         self.reset_history();
     }
 
-    /// Кнопка «Сохранить» и Ctrl+S: у открытого файла сначала спрашиваем, куда сохранять.
+    /// «Сохранить» (Ctrl+S): в текущий файл; если файла ещё нет — как «Сохранить как…».
     fn save(&mut self) {
-        if self.file.is_some() {
-            self.ask_save = true;
-        } else {
-            self.save_as();
+        match self.file.clone() {
+            Some(path) => self.write_to(&path),
+            None => self.save_as(),
         }
     }
 
@@ -941,39 +937,6 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if cancel {
             self.ask_exit = false;
-        }
-    }
-
-    fn save_question(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.file.clone().filter(|_| self.ask_save) else {
-            self.ask_save = false;
-            return;
-        };
-        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let (mut here, mut other, mut cancel) = (false, false, false);
-        egui::Window::new("Сохранение")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(format!("Сохранить под текущим названием «{name}» или сохранить как новый файл?"));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    here = ui.button("Сохранить под текущим").clicked();
-                    other = ui.button("Сохранить как…").clicked();
-                    cancel = ui.button("Отмена").clicked();
-                });
-            });
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            cancel = true;
-        }
-        if here || other || cancel {
-            self.ask_save = false;
-        }
-        if here {
-            self.write_to(&path);
-        } else if other {
-            self.save_as();
         }
     }
 
@@ -1105,8 +1068,11 @@ impl App {
         if tool_button(ui, &self.icons.open_file, "Открыть деталь…", false) {
             self.open();
         }
-        if tool_button(ui, &self.icons.save_file, "Сохранить деталь (Ctrl+S)", false) {
+        if tool_button(ui, &self.icons.save_file, "Сохранить в текущий файл (Ctrl+S)", false) {
             self.save();
+        }
+        if tool_button(ui, &self.icons.save_as, "Сохранить как… (Ctrl+Shift+S)", false) {
+            self.save_as();
         }
         ui.menu_button("Файл", |ui| {
             if ui.button("Сохранить как…").clicked() {
@@ -3143,7 +3109,9 @@ impl eframe::App for App {
                 self.undo();
             }
         }
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S)) {
+            self.save_as();
+        } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save();
         }
         let modified = self.dirty || self.base_json != self.saved_json;
@@ -3204,7 +3172,6 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
         self.sketch_op_window(ui.ctx());
-        self.save_question(ui.ctx());
         self.exit_question(ui.ctx());
         self.track_history(ui.ctx());
 

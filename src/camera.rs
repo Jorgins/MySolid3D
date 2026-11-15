@@ -72,6 +72,14 @@ impl Camera {
         Some((half_height / tan).max(self.min_dist).max(1e-3))
     }
 
+    /// Единичное направление от точки к глазу — по нему проверяют, не закрыта ли точка деталью.
+    pub fn dir_to_eye(&self, rect: Rect, p: DVec3) -> DVec3 {
+        match self.eye_distance(rect) {
+            Some(dist) => (self.target - self.forward() * dist - p).try_normalize().unwrap_or(-self.forward()),
+            None => -self.forward(),
+        }
+    }
+
     pub fn project(&self, rect: Rect, p: DVec3) -> Pos2 {
         let d = p - self.target;
         let c = rect.center();
