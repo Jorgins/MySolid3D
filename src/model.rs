@@ -2575,9 +2575,9 @@ mod tests {
         let mut part: Part = serde_json::from_str(&json).unwrap();
         let body = part.rebuild(None).expect("тело примера");
         assert!(body.faces().all(|f| f.surface_area() > 0.0));
-        // «Скругление9» в примере невыполнимо само по себе; остальные элементы должны строиться.
+        // Рёбра «Скругления9» после правок размеров сдвинулись — теперь они находятся заново, и всё строится.
         let failed: Vec<u64> = part.features.iter().filter(|f| f.error.is_some()).map(|f| f.id).collect();
-        assert_eq!(failed, [32]);
+        assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(RenderMesh::from_shape(&body).torn_edges(), 0);
     }
 
