@@ -2703,6 +2703,29 @@ impl App {
         // Точка тела закрыта, если на пути к глазу есть грань детали.
         let (mesh, eye) = (self.mesh.clone(), -cam.forward());
         let hidden = |p: DVec3| mesh.pick_hit(p + eye * 0.02, eye).is_some();
+        // Неподвижные точки для связей стрелкой: середины отрезков более ранних эскизов,
+        // вершины и середины видимых рёбер тела, лежащих в плоскости эскиза.
+        let fixed_points: Vec<DVec2> = if edit.tool == Tool::Select {
+            let mut out: Vec<DVec2> = self.part.sketch(edit.id).map(|s| s.ext_midpoints()).unwrap_or_default();
+            let normal = plane.normal();
+            for edge in &self.mesh.edges {
+                let (Some(a), Some(b)) = (edge.points.first(), edge.points.last()) else { continue };
+                for p in [*a, *b, edge.mid] {
+                    if (p - plane.origin).dot(normal).abs() < 1e-4 && !hidden(p) {
+                        out.push(plane.to_local(p));
+                    }
+                }
+            }
+            let mut unique: Vec<DVec2> = Vec::new();
+            for p in out {
+                if unique.iter().all(|q| (*q - p).length() > 1e-6) {
+                    unique.push(p);
+                }
+            }
+            unique
+        } else {
+            Vec::new()
+        };
         let skip = if edit.tool == Tool::Select { edit.selected } else { None };
         let (own_points, own_lines) = match (self.snap_objects, self.part.sketch(edit.id)) {
             (true, Some(sketch)) => sketch_snap_targets(sketch, skip),
@@ -3066,7 +3089,16 @@ impl App {
                 let clicked = clicked && !corner_click;
                 // Щелчок по точке контура или по началу координат отмечает её для связи (до двух точек).
                 if clicked && !dragging_vertex {
-                    let hit = pointer.and_then(raw_at).and_then(|p| sketch.pick_point(p, 8.0 * px));
+                    let hit = pointer.and_then(raw_at).and_then(|p| {
+                        sketch.pick_point(p, 8.0 * px).or_else(|| {
+                            fixed_points
+                                .iter()
+                                .map(|q| ((*q - p).length(), *q))
+                                .filter(|(d, _)| *d < 8.0 * px)
+                                .min_by(|a, b| a.0.total_cmp(&b.0))
+                                .map(|(_, q)| Pick::Fixed(q))
+                        })
+                    });
                     match hit {
                         Some(r) if edit.points_sel.contains(&r) => edit.points_sel.retain(|x| *x != r),
                         Some(r) => {
@@ -3322,6 +3354,15 @@ impl App {
                     }
                 }
             }
+            // Точки других эскизов и тела — голубые ромбики: они неподвижны, к ним подгоняется своя точка.
+            for q in &fixed_points {
+                let c = cam.project(rect, plane.to_world(*q));
+                if rect.contains(c) && !edit.points_sel.contains(&Pick::Fixed(*q)) {
+                    let r = 4.0;
+                    let diamond = vec![c + Vec2::new(0.0, -r), c + Vec2::new(r, 0.0), c + Vec2::new(0.0, r), c + Vec2::new(-r, 0.0)];
+                    painter.add(egui::Shape::closed_line(diamond, Stroke::new(1.5, Color32::from_rgb(110, 190, 255))));
+                }
+            }
         }
         for r in &edit.points_sel {
             if let Some(q) = sketch.pick_pos(*r) {
@@ -3347,7 +3388,7 @@ impl App {
                                     }
                                 }
                             } else {
-                                ui.weak("Выберите вторую точку, середину отрезка или начало координат");
+                                ui.weak("Выберите вторую точку: точку или середину отрезка (ромбик), точку тела (голубой ромбик) или начало координат");
                             }
                             if ui.small_button("✕").on_hover_text("Снять выбор точек").clicked() {
                                 edit.points_sel.clear();

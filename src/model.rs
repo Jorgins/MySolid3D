@@ -766,6 +766,9 @@ pub enum Pick {
     Ref(DimRef),
     /// Середина сегмента: (фигура, номер сегмента).
     Mid(usize, usize),
+    /// Неподвижная точка вне эскиза в его координатах: середина отрезка более раннего эскиза,
+    /// вершина или середина ребра тела в плоскости эскиза. Нужна только для однократной связи.
+    Fixed(DVec2),
 }
 
 /// Как измеряется расстояние между двумя точками.
@@ -1108,7 +1111,13 @@ impl Sketch {
                 let (a, b, bulge) = self.shapes.get(s)?.segment(i)?;
                 Some(if bulge == 0.0 { (a + b) * 0.5 } else { arc_mid(a, b, bulge) })
             }
+            Pick::Fixed(p) => Some(p),
         }
+    }
+
+    /// Середины отрезков более ранних эскизов в плоскости этого эскиза (см. `ext_cache`).
+    pub fn ext_midpoints(&self) -> Vec<DVec2> {
+        self.ext_cache.iter().filter(|(k, _)| k.3).map(|(_, (a, b))| (*a + *b) * 0.5).collect()
     }
 
     /// Выбираемая точка рядом с `p`: сначала точки контура и начало координат, потом середины сегментов.
@@ -1149,6 +1158,8 @@ impl Sketch {
         let as_ref = |p: Pick| match p {
             Pick::Ref(r) => r,
             Pick::Mid(s, i) => DimRef::Segment(s, i),
+            // Неподвижна, как начало координат: подгоняется другая точка.
+            Pick::Fixed(_) => DimRef::Origin,
         };
         self.nudge(as_ref(a), as_ref(b), d, None)
     }
@@ -2658,6 +2669,19 @@ mod tests {
 
     fn sketch(shapes: Vec<SketchShape>) -> Sketch {
         Sketch::new(Plane::TOP, shapes)
+    }
+
+    #[test]
+    fn circle_aligns_to_fixed_point_of_body() {
+        // Центр окружности ставится на одну вертикаль с серединой ребра тела (неподвижной точкой).
+        let mut sk = sketch(vec![SketchShape::Circle { cx: 0.0, cy: -10.0, r: 6.0 }]);
+        let mid = Pick::Fixed(DVec2::new(7.5, 19.0));
+        let center = Pick::Ref(DimRef::Point(0, 0));
+        sk.align(mid, center, Relation::Vertical).unwrap();
+        assert!(matches!(sk.shapes[0], SketchShape::Circle { cx, cy, r } if (cx - 7.5).abs() < 1e-9 && cy == -10.0 && r == 6.0));
+        // Порядок выбора не важен: неподвижная точка остаётся на месте.
+        sk.align(center, Pick::Fixed(DVec2::new(3.0, 2.0)), Relation::Horizontal).unwrap();
+        assert!(matches!(sk.shapes[0], SketchShape::Circle { cx, cy, .. } if (cx - 7.5).abs() < 1e-9 && (cy - 2.0).abs() < 1e-9));
     }
 
     fn close(a: DVec2, x: f64, y: f64) -> bool {
