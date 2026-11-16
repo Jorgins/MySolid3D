@@ -8,6 +8,7 @@ use crate::model::{
 use crate::render::{DrawParams, ImageItem, RenderMode, Renderer};
 
 mod api;
+mod journal;
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Painter, PointerButton, Pos2, Rect, Response, Stroke, Vec2,
 };
@@ -657,6 +658,8 @@ pub struct App {
     last_fillet: f64,
     last_chamfer: f64,
     last_depth: f64,
+    /// Журнал действий пользователя и их результатов (см. `journal.rs`).
+    journal: journal::Journal,
 }
 
 /// Размеры показываются и вводятся в миллиметрах с точностью до 0,1.
@@ -770,6 +773,7 @@ impl App {
             last_fillet: 2.0,
             last_chamfer: 1.0,
             last_depth: 10.0,
+            journal: journal::Journal::new(),
         };
         app.reset_history();
         // Файл детали можно передать аргументом командной строки (в т.ч. «Открыть с помощью»).
@@ -879,6 +883,7 @@ impl App {
         let Ok(json) = serde_json::to_string(&self.part) else { return };
         if json != self.base_json {
             let previous = std::mem::replace(&mut self.base, self.part.clone());
+            self.journal_change(&previous);
             self.undo.push(previous);
             if self.undo.len() > 100 {
                 self.undo.remove(0);
@@ -891,16 +896,18 @@ impl App {
     fn undo(&mut self) {
         if let Some(previous) = self.undo.pop() {
             let current = std::mem::replace(&mut self.base, previous.clone());
-            self.redo.push(current);
+            self.redo.push(current.clone());
             self.restore(previous);
+            self.journal_after_rebuild("Отмена (Ctrl+Z)", Some(current));
         }
     }
 
     fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
             let current = std::mem::replace(&mut self.base, next.clone());
-            self.undo.push(current);
+            self.undo.push(current.clone());
             self.restore(next);
+            self.journal_after_rebuild("Повтор (Ctrl+Y)", Some(current));
         }
     }
 
@@ -955,6 +962,8 @@ impl App {
         let Some(plane) = self.part.sketch(id).map(|s| s.plane) else { return };
         self.cam.look_at_plane(&plane);
         self.sketch = Some(SketchEdit::new(id));
+        let name = self.part.feature(id).map_or(String::new(), |f| f.name.clone());
+        self.journal_log(&format!("Вход в эскиз «{name}»"), &[], false);
         self.selection = Selection::Feature(id);
         self.status.clear();
         self.dirty = true;
@@ -970,6 +979,10 @@ impl App {
             if sketch.shapes.iter().any(|s| !s.is_closed() && !s.is_construction()) {
                 self.status = "В эскизе остался незамкнутый контур — вытянуть его не получится".into();
             }
+        }
+        if let Some(id) = self.sketch.as_ref().map(|e| e.id) {
+            let name = self.part.feature(id).map_or(String::new(), |f| f.name.clone());
+            self.journal_log(&format!("Выход из эскиза «{name}»"), &[], false);
         }
         self.sketch = None;
         self.dim_edit = None;
@@ -1052,6 +1065,7 @@ impl App {
         self.dirty = true;
         self.file = None;
         self.reset_history();
+        self.journal_after_rebuild("Новая деталь", None);
     }
 
     /// «Сохранить» (Ctrl+S): в текущий файл; если файла ещё нет — как «Сохранить как…».
@@ -1173,6 +1187,7 @@ impl App {
                 self.fit_while_building = true;
                 self.remember_file(path, true);
                 self.status = format!("Открыто: {}", path.display());
+                self.journal_after_rebuild(&format!("Открыт файл {}", path.display()), None);
             }
             Err(e) => {
                 // Файл пропал или испорчен — в списке последних ему не место.
@@ -1260,6 +1275,14 @@ impl App {
             {
                 let ctx = ui.ctx().clone();
                 self.api_set_enabled(&ctx, api_on);
+            }
+            if ui
+                .button("Журнал действий…")
+                .on_hover_text("Запись ваших действий и их результатов: правки, ошибки, снимки окна, заметки")
+                .clicked()
+            {
+                self.journal.window = true;
+                ui.close();
             }
             ui.separator();
             if ui.button("Экспорт STL (для печати)…").clicked() {
@@ -3970,7 +3993,9 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
         self.sketch_op_window(ui.ctx());
         self.exit_question(ui.ctx());
+        self.journal_window(ui.ctx());
         self.track_history(ui.ctx());
+        self.journal_frame(ui.ctx());
 
         if self.dirty {
             ui.ctx().request_repaint();

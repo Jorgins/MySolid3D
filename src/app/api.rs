@@ -249,6 +249,7 @@ impl App {
         let Some(rx) = &self.api_rx else { return };
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for request in requests {
+            self.journal_api(&request.body);
             let answer = self.api_request(frame, &request.body);
             let _ = request.reply.send(answer);
         }
@@ -348,7 +349,7 @@ impl App {
     }
 
     /// Объём тела в мм³ по сетке показа (у криволинейных поверхностей — приближённо, ошибка порядка десятых долей процента).
-    fn mesh_volume(&self) -> f64 {
+    pub(super) fn mesh_volume(&self) -> f64 {
         let v = &self.mesh.vertices;
         let at = |k: u32| {
             let o = k as usize * 7;
