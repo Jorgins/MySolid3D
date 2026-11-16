@@ -3455,7 +3455,7 @@ impl App {
             }
         }
         if edit.tool == Tool::Dimension {
-            // Элементы более ранних эскизов: к ним тоже можно привязать размер.
+            // Элементы более ранних эскизов и рёбра тела в плоскости эскиза: к ним тоже можно привязать размер.
             let pale = Color32::from_rgba_unmultiplied(120, 190, 255, 170);
             for (&(_, _, _, seg), (a, b)) in sketch.ext_cache.iter().take(4000) {
                 if seg {
@@ -3675,7 +3675,7 @@ impl App {
             close |= enter || esc || !inside;
             de.focus = !close;
         }
-        let dim = de.dim;
+        let mut dim = de.dim;
         let place = de.place;
         let text = de.text.trim().replace(',', ".");
         let sketch = self.sketch.as_ref().and_then(|e| self.part.sketch_mut(e.id));
@@ -3695,7 +3695,9 @@ impl App {
                         sketch.rekey_dim_place(old, dim);
                     }
                     None => {
-                        let _ = sketch.store_dim(dim);
+                        // Размер к ребру тела записывается с постоянной ссылкой на ребро.
+                        let i = sketch.store_dim(dim);
+                        dim = sketch.dims[i];
                         if let Some(place) = place {
                             sketch.set_dim_place(dim, place);
                         }

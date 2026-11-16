@@ -41,9 +41,9 @@ pub(super) struct Journal {
     api_recent: bool,
 }
 
-/// Признак «журнал выключен»: пустой файл рядом со списком последних файлов.
-fn off_flag_path() -> Option<PathBuf> {
-    recent_list_path().map(|p| p.with_file_name("journal_off"))
+/// Признак «журнал включён»: пустой файл рядом со списком последних файлов. По умолчанию журнал выключен.
+fn on_flag_path() -> Option<PathBuf> {
+    recent_list_path().map(|p| p.with_file_name("journal_on"))
 }
 
 fn journal_root() -> Option<PathBuf> {
@@ -88,7 +88,7 @@ fn now() -> (String, String) {
 impl Journal {
     pub fn new() -> Self {
         Self {
-            enabled: !off_flag_path().is_some_and(|p| p.exists()),
+            enabled: on_flag_path().is_some_and(|p| p.exists()),
             dir: None,
             step: 0,
             entries: Vec::new(),
@@ -103,14 +103,14 @@ impl Journal {
 
     fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
-        if let Some(flag) = off_flag_path() {
+        if let Some(flag) = on_flag_path() {
             if on {
-                let _ = std::fs::remove_file(flag);
-            } else {
                 if let Some(dir) = flag.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
                 let _ = std::fs::write(flag, "");
+            } else {
+                let _ = std::fs::remove_file(flag);
             }
         }
     }

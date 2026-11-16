@@ -617,7 +617,29 @@ pub struct Sketch {
     /// Точки и отрезки более ранних эскизов в плоскости этого эскиза (обновляется перед показом; в файл не пишется).
     #[serde(skip)]
     pub ext_cache: std::collections::HashMap<ExtKey, (DVec2, DVec2)>,
+    /// Рёбра и вершины тела, к которым привязаны размеры этого эскиза: `DimRef::Ext(BODY, номер, 0, это ребро)`.
+    #[serde(default)]
+    pub body_refs: Vec<BodyRef>,
+    /// Рёбра и вершины тела в плоскости эскиза, к которым ещё ничего не привязано (обновляется перед показом):
+    /// в `ext_cache` они под номерами `BODY_CANDIDATE + i`; при постановке размера переходят в `body_refs`.
+    #[serde(skip)]
+    pub body_candidates: Vec<BodyRef>,
 }
+
+/// Прямое ребро или вершина тела, к которым привязан размер эскиза. Хранится положением в мире на момент
+/// привязки; при показе эскиза ищется заново среди рёбер тела в его плоскости (ребро — по направлению
+/// и ближайшей середине, вершина — ближайшая), поэтому размер держится за ребро и после правки тела.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BodyRef {
+    pub a: DVec3,
+    pub b: DVec3,
+    pub seg: bool,
+}
+
+/// «Номер эскиза» в ключах `ext_cache` для элементов тела (настоящие номера элементов начинаются с 1).
+pub const BODY: u64 = 0;
+/// С этого номера в `ext_cache` идут элементы тела, к которым ещё не привязан ни один размер.
+pub const BODY_CANDIDATE: usize = 1 << 20;
 
 /// Картинка-подложка эскиза. В файле детали хранится только путь к ней.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -910,7 +932,17 @@ fn shift_chain(
 
 impl Sketch {
     pub fn new(plane: Plane, shapes: Vec<SketchShape>) -> Self {
-        Self { plane, shapes, dims: Vec::new(), image: None, dim_places: Vec::new(), region_sel: Vec::new(), ext_cache: Default::default() }
+        Self {
+            plane,
+            shapes,
+            dims: Vec::new(),
+            image: None,
+            dim_places: Vec::new(),
+            region_sel: Vec::new(),
+            ext_cache: Default::default(),
+            body_refs: Vec::new(),
+            body_candidates: Vec::new(),
+        }
     }
 
     /// Удаляет фигуру вместе с её размерами; размеры остальных фигур остаются на своих местах.
@@ -1023,7 +1055,15 @@ impl Sketch {
     }
 
     /// Ставит размер в эскиз (повторно тот же размер не добавляется). Возвращает его номер.
+    /// Ставит размер (если такого ещё нет) и возвращает его номер. Элементы тела, к которым размер
+    /// привязан впервые, запоминаются в `body_refs` — поэтому записанный размер может отличаться
+    /// от переданного: берите его из `dims` по возвращённому номеру.
     pub fn store_dim(&mut self, dim: Dim) -> usize {
+        let dim = match dim {
+            Dim::Size(r) => Dim::Size(self.keep_body_ref(r)),
+            Dim::Distance(a, b, mode) => Dim::Distance(self.keep_body_ref(a), self.keep_body_ref(b), mode),
+            Dim::Angle(a, b) => Dim::Angle(self.keep_body_ref(a), self.keep_body_ref(b)),
+        };
         match self.dims.iter().position(|d| *d == dim) {
             Some(i) => i,
             None => {
@@ -1113,6 +1153,25 @@ impl Sketch {
             }
             Pick::Fixed(p) => Some(p),
         }
+    }
+
+    /// Элемент тела без привязки (`BODY_CANDIDATE + i`) становится постоянной ссылкой в `body_refs`.
+    fn keep_body_ref(&mut self, r: DimRef) -> DimRef {
+        let DimRef::Ext(BODY, k, i, seg) = r else { return r };
+        let Some(candidate) = k.checked_sub(BODY_CANDIDATE).and_then(|c| self.body_candidates.get(c).copied()) else {
+            return r;
+        };
+        let m = match self.body_refs.iter().position(|x| *x == candidate) {
+            Some(m) => m,
+            None => {
+                self.body_refs.push(candidate);
+                self.body_refs.len() - 1
+            }
+        };
+        if let Some(geom) = self.ext_cache.get(&(BODY, k, i, seg)).copied() {
+            self.ext_cache.insert((BODY, m, i, seg), geom);
+        }
+        DimRef::Ext(BODY, m, i, seg)
     }
 
     /// Середины отрезков более ранних эскизов в плоскости этого эскиза (см. `ext_cache`).
@@ -1826,9 +1885,80 @@ impl Part {
                 }
             }
         }
-        if let Some(sketch) = self.sketch_mut(id) {
-            sketch.ext_cache = cache;
+        // Прямые рёбра и вершины тела (каким оно было до этого эскиза), лежащие в плоскости эскиза.
+        let mesh = self.mesh(Some(id));
+        let normal = plane.normal();
+        let in_plane = |p: DVec3| (p - plane.origin).dot(normal).abs() < 1e-3;
+        let (mut lines, mut points): (Vec<(DVec3, DVec3)>, Vec<DVec3>) = (Vec::new(), Vec::new());
+        for edge in &mesh.edges {
+            let (Some(&a), Some(&b)) = (edge.points.first(), edge.points.last()) else { continue };
+            if !in_plane(a) || !in_plane(b) || (b - a).length() < 1e-6 {
+                continue;
+            }
+            let dir = (b - a).normalize();
+            if edge.points.iter().any(|p| (*p - a).cross(dir).length() > 1e-3) {
+                continue;
+            }
+            lines.push((a, b));
+            for p in [a, b] {
+                if points.iter().all(|q| (*q - p).length() > 1e-6) {
+                    points.push(p);
+                }
+            }
         }
+        let local = |p: DVec3| plane.to_local(p);
+        let Some(sketch) = self.sketch_mut(id) else { return };
+        // Сначала находим заново то, к чему размеры уже привязаны.
+        let (mut line_used, mut point_used) = (vec![false; lines.len()], vec![false; points.len()]);
+        for (k, r) in sketch.body_refs.iter().enumerate() {
+            let found = if r.seg {
+                let (dir, mid) = ((r.b - r.a).normalize_or_zero(), (r.a + r.b) * 0.5);
+                let off = |(a, b): &(DVec3, DVec3)| ((*a + *b) * 0.5 - mid).length();
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (a, b))| (*b - *a).normalize().cross(dir).length() < 1e-3)
+                    .min_by(|x, y| off(x.1).total_cmp(&off(y.1)))
+                    .map(|(j, &(a, b))| {
+                        line_used[j] = true;
+                        (a, b)
+                    })
+            } else {
+                let off = |p: &DVec3| (*p - r.a).length();
+                points.iter().enumerate().min_by(|x, y| off(x.1).total_cmp(&off(y.1))).map(|(j, &p)| {
+                    point_used[j] = true;
+                    (p, p)
+                })
+            };
+            // Ребро исчезло — размер показывается от того места, где оно было.
+            let (a, b) = found.unwrap_or((r.a, r.b));
+            cache.insert((BODY, k, 0, r.seg), (local(a), if r.seg { local(b) } else { DVec2::ZERO }));
+        }
+        // Остальные рёбра и вершины — кандидаты для новых размеров (кроме совпадающих с элементами эскизов).
+        let near = |p: DVec2, q: DVec2| (p - q).length() < 1e-4;
+        let same_line = |p: DVec2, q: DVec2| {
+            cache.iter().any(|(k, (a, b))| {
+                k.0 != BODY && k.3 && ((near(*a, p) && near(*b, q)) || (near(*a, q) && near(*b, p)))
+            })
+        };
+        let same_point = |p: DVec2| cache.iter().any(|(k, (a, _))| k.0 != BODY && !k.3 && near(*a, p));
+        let mut candidates = Vec::new();
+        let mut extra = Vec::new();
+        for (j, &(a, b)) in lines.iter().enumerate() {
+            if !line_used[j] && !same_line(local(a), local(b)) {
+                extra.push(((BODY, BODY_CANDIDATE + candidates.len(), 0, true), (local(a), local(b))));
+                candidates.push(BodyRef { a, b, seg: true });
+            }
+        }
+        for (j, &p) in points.iter().enumerate() {
+            if !point_used[j] && !same_point(local(p)) {
+                extra.push(((BODY, BODY_CANDIDATE + candidates.len(), 0, false), (local(p), DVec2::ZERO)));
+                candidates.push(BodyRef { a: p, b: p, seg: false });
+            }
+        }
+        cache.extend(extra);
+        sketch.ext_cache = cache;
+        sketch.body_candidates = candidates;
     }
 
     pub fn sketch(&self, id: u64) -> Option<&Sketch> {
@@ -3093,6 +3223,46 @@ mod tests {
         // Рядом с серединой отрезка она находится щелчком, а вершины важнее.
         assert_eq!(s.pick_point(DVec2::new(0.1, 0.1), 1.0), Some(Pick::Ref(DimRef::Point(0, 0))));
         assert!(matches!(s.pick_point(s.pick_pos(mid_a).unwrap() + DVec2::new(0.2, 0.0), 1.0), Some(Pick::Mid(0, 0))));
+    }
+
+    #[test]
+    fn dimension_to_body_edge_follows_body() {
+        let _kernel = kernel();
+        // Брусок 40×30×20 и эскиз на его правой грани (x = 40): оси эскиза — Y и Z мира.
+        let mut part = Part::default();
+        let base = part.add("Эскиз", FeatureKind::Sketch(Sketch::new(Plane::TOP, vec![rect(0.0, 0.0, 40.0, 30.0)])));
+        part.add("Бобышка", FeatureKind::Boss { sketch: base, depth: 20.0, flip: false });
+        let face = Plane { origin: DVec3::new(40.0, 0.0, 0.0), x: DVec3::Y, y: DVec3::Z };
+        let circle = SketchShape::Circle { cx: 15.0, cy: 5.0, r: 3.0 };
+        let on_face = part.add("Эскиз", FeatureKind::Sketch(Sketch::new(face, vec![circle])));
+        part.rebuild(None);
+        part.refresh_ext(on_face);
+        // Верхнее ребро грани (z = 20) есть только у тела — его можно выбрать для размера.
+        let sk = part.sketch(on_face).unwrap();
+        let top = sk.pick_ref(DVec2::new(15.0, 20.1), 0.5).expect("ребро тела не выбирается");
+        assert!(matches!(top, DimRef::Ext(BODY, k, 0, true) if k >= BODY_CANDIDATE), "{top:?}");
+        let center = DimRef::Point(0, 0);
+        let dim = sk.pair_dim(top, center).unwrap();
+        assert!((sk.dim_value(&dim).unwrap() - 15.0).abs() < 1e-6);
+        // Поставленный размер запоминает ребро постоянной ссылкой; новое значение двигает окружность.
+        let sk = part.sketch_mut(on_face).unwrap();
+        let i = sk.store_dim(dim);
+        let stored = sk.dims[i];
+        assert_eq!(sk.body_refs.len(), 1);
+        assert!(matches!(stored, Dim::Distance(DimRef::Ext(BODY, 0, 0, true), _, _)), "{stored:?}");
+        sk.set_dim(&stored, 8.0).unwrap();
+        assert!((sk.shapes[0].points()[0].y - 12.0).abs() < 1e-6, "{:?}", sk.shapes[0].points());
+        // Ссылка переживает сохранение в файл.
+        let json = serde_json::to_string(&part).unwrap();
+        let mut part: Part = serde_json::from_str(&json).unwrap();
+        // Брусок стал выше: ребро нашлось на новом месте, размер показывает новое расстояние.
+        if let FeatureKind::Boss { depth, .. } = &mut part.features[1].kind {
+            *depth = 25.0;
+        }
+        part.rebuild(None);
+        part.refresh_ext(on_face);
+        let sk = part.sketch(on_face).unwrap();
+        assert!((sk.dim_value(&sk.dims[0]).unwrap() - 13.0).abs() < 1e-6, "{:?}", sk.dim_value(&sk.dims[0]));
     }
 
     #[test]
